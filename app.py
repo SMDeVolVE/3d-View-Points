@@ -1735,6 +1735,121 @@ def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
 
 
 # ---------------------------------------------------------------------------
+# EXPORT HELPERS  (Sketchup/AutoCAD/Web/PNG — attacchabili a un incarto)
+# ---------------------------------------------------------------------------
+
+def _hex_to_rgb01(h: str) -> tuple[float, float, float]:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def mesh_to_obj(parts: dict, mtl_name: str | None = None) -> str:
+    """Wavefront OBJ multi-gruppo (un gruppo/material per parte mesh)."""
+    lines = ["# Point Cloud CAD Viewer — export OBJ"]
+    if mtl_name:
+        lines.append(f"mtllib {mtl_name}")
+    v_offset = 1
+    for name, (verts, faces) in parts.items():
+        if len(verts) == 0 or len(faces) == 0:
+            continue
+        lines.append(f"o {name}")
+        lines.append(f"g {name}")
+        if mtl_name:
+            lines.append(f"usemtl {name}")
+        for v in verts:
+            lines.append(f"v {float(v[0]):.4f} {float(v[1]):.4f} {float(v[2]):.4f}")
+        for tri in faces:
+            a = int(tri[0]) + v_offset
+            b = int(tri[1]) + v_offset
+            c = int(tri[2]) + v_offset
+            lines.append(f"f {a} {b} {c}")
+        v_offset += len(verts)
+    return "\n".join(lines) + "\n"
+
+
+def mesh_to_mtl(parts: dict) -> str:
+    """MTL che replica la palette CAD usata nel viewer."""
+    lines = ["# Point Cloud CAD Viewer — materials"]
+    for name in parts.keys():
+        r, g, b = _hex_to_rgb01(_color_for(name))
+        lines += [
+            f"newmtl {name}",
+            f"Kd {r:.3f} {g:.3f} {b:.3f}",
+            f"Ka {r*0.35:.3f} {g*0.35:.3f} {b*0.35:.3f}",
+            "Ks 0.050 0.050 0.050",
+            "Ns 16.0",
+            "illum 2",
+            "",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def mesh_to_obj_zip(parts: dict, base: str) -> bytes:
+    """Zip contenente {base}.obj + {base}.mtl, pronto per Sketchup/Blender."""
+    import io as _io
+    import zipfile as _zip
+    obj_text = mesh_to_obj(parts, mtl_name=f"{base}.mtl")
+    mtl_text = mesh_to_mtl(parts)
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as z:
+        z.writestr(f"{base}.obj", obj_text)
+        z.writestr(f"{base}.mtl", mtl_text)
+    return buf.getvalue()
+
+
+def mesh_to_dxf_bytes(parts: dict) -> bytes:
+    """DXF 3D con un layer per parte (walls/roof/windows/...), entità 3DFACE
+    per massima compatibilità AutoCAD/BricsCAD/LibreCAD/Sketchup."""
+    if not EZDXF_AVAILABLE:
+        raise RuntimeError("ezdxf non installato")
+    import io as _io
+    import ezdxf as _ez
+    doc = _ez.new("R2018", setup=True)
+    msp = doc.modelspace()
+    aci_by_prefix = {
+        "walls":   8,    # grigio
+        "roof":    32,   # marrone
+        "windows": 5,    # blu
+        "floor":   251,  # grigio scuro
+        "surface": 9,
+    }
+    for name, (verts, faces) in parts.items():
+        if len(verts) == 0 or len(faces) == 0:
+            continue
+        pref = next((p for p in aci_by_prefix if name.startswith(p)), None)
+        col = aci_by_prefix.get(pref, 7)
+        if name not in doc.layers:
+            doc.layers.add(name=name, color=col)
+        for tri in faces:
+            p0 = [float(x) for x in verts[int(tri[0])]]
+            p1 = [float(x) for x in verts[int(tri[1])]]
+            p2 = [float(x) for x in verts[int(tri[2])]]
+            msp.add_3dface([p0, p1, p2, p2], dxfattribs={"layer": name})
+    buf = _io.StringIO()
+    doc.write(buf)
+    return buf.getvalue().encode("utf-8")
+
+
+def fig_to_html_bytes(fig: go.Figure, title: str = "Modello 3D") -> bytes:
+    """HTML self-contained (Plotly via CDN) — apribile ovunque, 3D interattivo."""
+    html = fig.to_html(
+        include_plotlyjs="cdn", full_html=True,
+        config={"displaylogo": False, "toImageButtonOptions": {"format": "png", "scale": 2}},
+    )
+    # Inietta un <title> pulito
+    html = html.replace("<head>", f"<head><title>{title}</title>", 1)
+    return html.encode("utf-8")
+
+
+def fig_to_png_bytes(fig: go.Figure, width: int = 1600, height: int = 1000) -> bytes | None:
+    """PNG ad alta risoluzione via kaleido (se disponibile)."""
+    try:
+        return fig.to_image(format="png", width=width, height=height, scale=2)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------------
 def _init_state():
@@ -1821,7 +1936,9 @@ with st.sidebar:
             )
         rect_params["add_windows"] = st.checkbox(
             "Aggiungi finestre",
-            value=(method == "building_rect"),
+            value=(method in ("building_rect", "building_squared")),
+            help="Distribuisce finestre procedurali sulle pareti esterne principali "
+                 "(look CAD per incarto energia).",
         )
         if rect_params["add_windows"]:
             rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
@@ -2105,6 +2222,66 @@ if st.session_state.mesh_data:
     c1.metric("Parti mesh", len(parts))
     c2.metric("Vertici", f"{total_v:,}")
     c3.metric("Triangoli", f"{total_f:,}")
+
+    # ─── EXPORT ──────────────────────────────────────────────────────────────
+    st.markdown("#### 📥 Esporta per l'incarto energia")
+    st.caption(
+        "Scarica il modello direttamente allegabile all'incarto — niente SketchUp, "
+        "niente rielaborazione esterna."
+    )
+    base = Path(uploaded.name).stem or "modello"
+    ec1, ec2, ec3, ec4 = st.columns(4)
+
+    try:
+        obj_zip = mesh_to_obj_zip(parts, base)
+        ec1.download_button(
+            "⬇ OBJ + MTL (zip)",
+            data=obj_zip, file_name=f"{base}_obj.zip",
+            mime="application/zip", use_container_width=True,
+            help="Apribile in SketchUp / Blender / Rhino con colori CAD preservati.",
+        )
+    except Exception as e:
+        ec1.button("OBJ non disponibile", disabled=True, use_container_width=True)
+        ec1.caption(f"Errore: {e}")
+
+    if EZDXF_AVAILABLE:
+        try:
+            dxf_bytes = mesh_to_dxf_bytes(parts)
+            ec2.download_button(
+                "⬇ DXF 3D (AutoCAD)",
+                data=dxf_bytes, file_name=f"{base}.dxf",
+                mime="application/dxf", use_container_width=True,
+                help="3DFACE + layer per parte (walls/roof/windows).",
+            )
+        except Exception as e:
+            ec2.button("DXF non disponibile", disabled=True, use_container_width=True)
+            ec2.caption(f"Errore: {e}")
+    else:
+        ec2.button("DXF — manca ezdxf", disabled=True, use_container_width=True)
+
+    try:
+        html_bytes = fig_to_html_bytes(fig_3d, title=f"Modello 3D — {base}")
+        ec3.download_button(
+            "⬇ HTML interattivo",
+            data=html_bytes, file_name=f"{base}.html",
+            mime="text/html", use_container_width=True,
+            help="Pagina autonoma con 3D ruotabile — allegabile a mail/incarto.",
+        )
+    except Exception as e:
+        ec3.button("HTML non disponibile", disabled=True, use_container_width=True)
+        ec3.caption(f"Errore: {e}")
+
+    png_bytes = fig_to_png_bytes(fig_3d)
+    if png_bytes:
+        ec4.download_button(
+            "⬇ PNG (alta risoluzione)",
+            data=png_bytes, file_name=f"{base}.png",
+            mime="image/png", use_container_width=True,
+            help="Immagine 1600×1000 @2x — incollabile direttamente nel documento.",
+        )
+    else:
+        ec4.button("PNG — installa kaleido", disabled=True, use_container_width=True)
+        ec4.caption("`pip install kaleido` per l'export statico PNG.")
 
     df_3d = st.session_state.cropped_df if st.session_state.cropped_df is not None else df_filtered
     with st.expander("🔎 Anteprima dati"):
