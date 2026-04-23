@@ -770,9 +770,15 @@ def _orthogonal_footprint_raster(xy: np.ndarray, epsilon: float,
     counts = np.zeros((ny, nx), dtype=np.int32)
     np.add.at(counts, (iy, ix), 1)
 
-    # soglia: celle con <= max(1, 5% della densità media) sono rumore
-    avg_density = len(rot) / max(counts.size, 1)
-    density_thr = max(1, int(avg_density * 0.05))
+    # Soglia densità robusta: relativa alla MEDIANA delle celle occupate
+    # (non alla media su tutta la griglia). Così zone a densità bassa ma
+    # consistente — es. base larga di un edificio multi-livello la cui torre
+    # centrale è molto più densa — non vengono erroneamente tagliate.
+    occupied = counts[counts > 0]
+    if occupied.size == 0:
+        return xy.astype(np.float32)
+    med = float(np.median(occupied))
+    density_thr = max(0, int(med * 0.10))  # 10% mediana, minimo 0 (≥1 punto)
     grid = counts > density_thr
 
     # morfologia: chiude gap e smussa piccoli staircase
@@ -877,8 +883,16 @@ def _segment_heights(points: np.ndarray, z_floor: float, z_roof: float,
                      ) -> list[tuple[float, np.ndarray]]:
     """
     Rileva quote di gronda distinte (piani sfalsati) e restituisce una
-    lista di blocchi (z_top, xy_points_of_that_block) ordinata per z_top
-    crescente. Ogni blocco contiene i punti che appartengono a quella quota.
+    lista di blocchi (z_top, xy_points) ordinata per z_top crescente.
+
+    COMPORTAMENTO CUMULATIVO (fix multi_height):
+      Per ogni gronda z_k, il blocco contiene TUTTI i punti che raggiungono
+      almeno quella quota. Così:
+        - blocco basso → footprint grande (tutto l'edificio)
+        - blocco medio → footprint intermedio (base + torre)
+        - blocco alto  → footprint piccolo (solo torre)
+      I prismi risultano annidati e visivamente coerenti (torre su base),
+      anziché frammenti disgiunti.
     """
     total_h = z_roof - z_floor
     if total_h < 1e-6 or len(points) < 30:
@@ -887,7 +901,6 @@ def _segment_heights(points: np.ndarray, z_floor: float, z_roof: float,
             body = points
         return [(z_roof, body[:, :2])]
 
-    # restringi al "corpo" dell'edificio, escludendo il terreno
     body = points[points[:, 2] > z_floor + 0.35 * total_h]
     if len(body) < 30:
         return [(z_roof, body[:, :2] if len(body) else points[:, :2])]
@@ -911,14 +924,24 @@ def _segment_heights(points: np.ndarray, z_floor: float, z_roof: float,
     if len(peaks) == 0:
         return [(z_roof, body[:, :2])]
 
-    # top-N picchi per altezza di histogram (più densi = più importanti)
+    # top-N picchi per altezza di histogram (più densi = più significativi)
     order = np.argsort(hist[peaks])[::-1][:max_blocks]
     peak_z = sorted(float(centers[peaks[i]]) for i in order)
 
+    # Filtro: rimuovi picchi troppo ravvicinati verticalmente
+    # (frequente artefatto: due "picchi" a 30 cm di distanza dallo stesso tetto piatto)
+    min_dz = max(1.2, total_h * 0.10)
+    filtered = [peak_z[0]] if peak_z else []
+    for z in peak_z[1:]:
+        if z - filtered[-1] >= min_dz:
+            filtered.append(z)
+    peak_z = filtered
+
+    # CUMULATIVO: ogni blocco prende i punti con z >= (pz - tol)
     blocks = []
-    tol = total_h * 0.06
+    tol = total_h * 0.03
     for pz in peak_z:
-        mask = np.abs(body[:, 2] - pz) < tol
+        mask = body[:, 2] >= pz - tol
         pts_xy = body[mask][:, :2]
         if len(pts_xy) >= 10:
             blocks.append((pz, pts_xy))
@@ -1923,16 +1946,24 @@ with st.sidebar:
                 ),
             )
             rect_params["roof_top_frac"] = st.slider(
-                "Filtro tetto (% altezza)", 0.05, 0.40, 0.10, 0.01,
+                "Filtro tetto (% altezza)", 0.05, 1.00, 0.25, 0.05,
                 help=(
                     "Usa solo i punti nel top-N% dell'altezza per stimare la sagoma."
-                    "\nEvita che vegetazione/terreno sporchino il perimetro."
+                    "\n• 0.10 → solo la linea di gronda (escludi vegetazione alta)."
+                    "\n• 0.25 → compromesso: sagoma pulita senza perdere rientranze."
+                    "\n• 1.00 → tutti i punti (se hai già ritagliato bene l'edificio)."
+                    "\nSe la pianta esce rettangolare ma vedi una C/L nella foto aerea,"
+                    " ALZA questo valore (0.5–1.0) e abbassa 'Semplificazione Sagoma'."
                 ),
             )
         if method == "building_squared":
             rect_params["multi_height"] = st.checkbox(
                 "Rileva piani sfalsati (multi-altezze)", value=False,
-                help="Rileva gronde multiple → più blocchi separati.",
+                help=(
+                    "SOLO per un edificio con TORRE/ATTICO su base più larga "
+                    "(volumi annidati). Non usarlo se hai due edifici affiancati: "
+                    "in quel caso ritaglia e genera un edificio alla volta."
+                ),
             )
         rect_params["add_windows"] = st.checkbox(
             "Aggiungi finestre",
