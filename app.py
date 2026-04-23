@@ -15,7 +15,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import pyvista as pv
 import streamlit as st
-import streamlit.components.v1 as components
 
 # CAD loaders opzionali
 try:
@@ -25,21 +24,10 @@ try:
 except ImportError:
     EZDXF_AVAILABLE = False
 
-# PyVista in modalità headless (server Streamlit)
+# PyVista lo usiamo solo per la ricostruzione geometrica (reconstruct_surface,
+# delaunay_2d). Il rendering lo fa Plotly: niente trame, niente subprocess,
+# niente export_html → niente crash su Streamlit Cloud.
 pv.OFF_SCREEN = True
-if os.name != "nt":
-    try:
-        pv.start_xvfb()
-    except Exception:
-        pass
-
-# PyVista.export_html() → trame → asyncio. Streamlit non gira in un event loop
-# jupyter-like, quindi serve nest_asyncio per permettere il launch del server trame.
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -299,98 +287,112 @@ def reconstruct(cloud: pv.PolyData, lod: int, method: str) -> pv.PolyData:
     return surf
 
 
-def generate_3d_html(
+def reconstruct_mesh_arrays(
     points: np.ndarray,
-    rgb: np.ndarray | None,
     lod: int,
     method: str,
-    show_points: bool,
     max_points: int = 60_000,
-    max_cells: int = 120_000,
-) -> str:
+    max_cells: int = 150_000,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Pipeline completo: PolyData → superficie → HTML standalone VTK.js.
-    - Downsample input a `max_points` per tenere la RAM sotto controllo.
-    - Decimation automatica se la mesh supera `max_cells` celle.
+    Usa PyVista per la ricostruzione, ritorna solo (vertices, faces_triangles)
+    come array numpy. Nessun rendering → nessuna dipendenza da trame/vtk.js/xvfb.
     """
-    # Downsample duro dei punti in ingresso (protegge da OOM)
+    # Downsample input (protezione OOM)
     if len(points) > max_points:
         idx = np.random.default_rng(42).choice(len(points), max_points, replace=False)
         points = points[idx]
-        if rgb is not None:
-            rgb = rgb[idx]
 
     cloud = pv.PolyData(points.astype(np.float32))
-    if rgb is not None:
-        cloud["RGB"] = rgb.astype(np.uint8)
-
     surf = reconstruct(cloud, lod, method)
+    # Assicura triangoli puri (Plotly Mesh3d richiede facce triangolari)
+    try:
+        surf = surf.triangulate()
+    except Exception:
+        pass
 
-    # Decima la mesh se è troppo densa per l'export HTML
+    # Decimation se troppo densa
     if surf.n_cells > max_cells:
         try:
             ratio = 1.0 - (max_cells / surf.n_cells)
-            surf = surf.decimate(ratio)
+            surf = surf.decimate(ratio).triangulate()
         except Exception:
             pass
 
-    pl = pv.Plotter(window_size=[900, 650], off_screen=True)
-    pl.set_background("#0E1117")
-
-    if surf.n_cells > 0:
-        pl.add_mesh(
-            surf,
-            color="#B8C4D6",
-            smooth_shading=True,
-            specular=0.4, specular_power=20,
-            ambient=0.25, diffuse=0.75,
-            show_edges=False, lighting=True,
-        )
+    verts = np.asarray(surf.points, dtype=np.float32)
+    if surf.n_cells > 0 and surf.faces.size > 0:
+        # surf.faces = [3, v0, v1, v2, 3, v3, v4, v5, ...]  (triangoli)
+        faces = surf.faces.reshape(-1, 4)[:, 1:4].astype(np.int32)
     else:
-        pl.add_mesh(cloud, color="#B8C4D6", point_size=3, render_points_as_spheres=True)
+        faces = np.zeros((0, 3), dtype=np.int32)
 
-    if show_points:
-        pl.add_mesh(cloud, color="#00E5FF", point_size=1.5,
-                    render_points_as_spheres=True, opacity=0.6)
+    return verts, faces
 
-    pl.enable_eye_dome_lighting()
-    pl.add_light(pv.Light(position=(1, 1, 1), intensity=0.6, light_type="scene light"))
-    pl.view_isometric()
 
-    # Export HTML (VTK.js). Se fallisce (trame/asyncio), fallback a screenshot statico.
-    tmp_path = None
-    html_str = ""
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
-            tmp_path = f.name
-        pl.export_html(tmp_path)
-        with open(tmp_path, "r", encoding="utf-8") as fh:
-            html_str = fh.read()
-    except Exception:
-        # Fallback: PNG base64 incapsulato in HTML
-        try:
-            import base64 as _b64
-            img = pl.screenshot(return_img=True, window_size=[900, 650])
-            from io import BytesIO as _BIO
-            from PIL import Image as _PILImg  # pillow arriva con pyvista/streamlit
-            buf = _BIO()
-            _PILImg.fromarray(img).save(buf, format="PNG")
-            b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
-            html_str = (
-                f'<div style="background:#0E1117;text-align:center;padding:10px;">'
-                f'<img src="data:image/png;base64,{b64}" '
-                f'style="max-width:100%;height:auto;"/></div>'
-            )
-        except Exception as e:
-            html_str = f'<div style="color:#FAFAFA;padding:20px;">Rendering fallito: {e}</div>'
-    finally:
-        if tmp_path:
-            try: os.unlink(tmp_path)
-            except OSError: pass
-        try: pl.close()
-        except Exception: pass
+def build_3d_figure(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    raw_points: np.ndarray | None = None,
+) -> go.Figure:
+    """Figura Plotly 3D con look CAD: mesh grigio-azzurra shadata + nuvola opzionale."""
+    fig = go.Figure()
 
-    return html_str
+    if len(faces) > 0:
+        fig.add_trace(go.Mesh3d(
+            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            color="#B8C4D6",
+            flatshading=False,
+            lighting=dict(
+                ambient=0.30, diffuse=0.80,
+                specular=0.40, roughness=0.50, fresnel=0.20,
+            ),
+            lightposition=dict(x=1000, y=2000, z=3000),
+            hoverinfo="skip",
+            name="Superficie",
+        ))
+    else:
+        # Nessuna mesh ricostruita → fallback a scatter 3D dei vertici
+        fig.add_trace(go.Scatter3d(
+            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+            mode="markers",
+            marker=dict(size=2, color=verts[:, 2], colorscale="Viridis"),
+            name="Punti",
+        ))
+
+    if raw_points is not None and len(raw_points) > 0:
+        # Sovrapponi nuvola (downsampled)
+        if len(raw_points) > 30_000:
+            idx = np.random.default_rng(0).choice(len(raw_points), 30_000, replace=False)
+            raw_points = raw_points[idx]
+        fig.add_trace(go.Scatter3d(
+            x=raw_points[:, 0], y=raw_points[:, 1], z=raw_points[:, 2],
+            mode="markers",
+            marker=dict(size=1.5, color="#00E5FF", opacity=0.55),
+            name="Nuvola",
+            hoverinfo="skip",
+        ))
+
+    axis = dict(
+        backgroundcolor="#0E1117",
+        gridcolor="#2A2F3A",
+        showbackground=True,
+        zerolinecolor="#3A4050",
+        color="#FAFAFA",
+    )
+    fig.update_layout(
+        scene=dict(
+            xaxis=axis, yaxis=axis, zaxis=axis,
+            aspectmode="data",
+            camera=dict(eye=dict(x=1.6, y=1.6, z=1.1)),
+        ),
+        paper_bgcolor="#0E1117",
+        plot_bgcolor="#0E1117",
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=650,
+        showlegend=False,
+    )
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +403,7 @@ def _init_state():
     ss.setdefault("current_file", None)
     ss.setdefault("cropped_df", None)
     ss.setdefault("last_selection", None)
-    ss.setdefault("mesh_html", None)
+    ss.setdefault("mesh_data", None)  # dict: {"verts": ndarray, "faces": ndarray, "points": ndarray|None}
 
 _init_state()
 
@@ -460,7 +462,7 @@ if st.session_state.current_file != file_id:
     st.session_state.current_file = file_id
     st.session_state.cropped_df = None
     st.session_state.last_selection = None
-    st.session_state.mesh_html = None
+    st.session_state.mesh_data = None
 
 # Parsing
 ext = Path(uploaded.name).suffix.lower()
@@ -593,7 +595,7 @@ with right:
     )
     if st.button("↩️ Reset", use_container_width=True):
         st.session_state.cropped_df = None
-        st.session_state.mesh_html = None
+        st.session_state.mesh_data = None
 
     # Logica di generazione
     source_df = None
@@ -612,16 +614,17 @@ with right:
         with st.spinner(f"Ricostruzione superficie su {len(source_df):,} punti..."):
             try:
                 pts = source_df[["X", "Y", "Z"]].to_numpy(dtype=np.float32)
-                has_rgb = {"R", "G", "B"}.issubset(source_df.columns)
-                rgb = source_df[["R", "G", "B"]].to_numpy(dtype=np.uint8) if has_rgb else None
-                html = generate_3d_html(
-                    points=pts, rgb=rgb,
-                    lod=lod, method=method, show_points=show_points,
+                verts, faces = reconstruct_mesh_arrays(
+                    points=pts, lod=lod, method=method,
                 )
-                st.session_state.mesh_html = html
+                st.session_state.mesh_data = {
+                    "verts": verts,
+                    "faces": faces,
+                    "points": pts if show_points else None,
+                }
             except Exception as e:
                 st.error(f"Errore nella ricostruzione 3D: {e}")
-                st.session_state.mesh_html = None
+                st.session_state.mesh_data = None
 
 # =========================================================================
 # STEP 2 — VISTA 3D RICOSTRUITA
@@ -629,8 +632,15 @@ with right:
 st.markdown("---")
 st.subheader("🏛️ Modello 3D ricostruito")
 
-if st.session_state.mesh_html:
-    components.html(st.session_state.mesh_html, height=670, scrolling=False)
+if st.session_state.mesh_data:
+    md = st.session_state.mesh_data
+    fig_3d = build_3d_figure(md["verts"], md["faces"], raw_points=md.get("points"))
+    st.plotly_chart(fig_3d, use_container_width=True, theme=None)
+
+    c1, c2 = st.columns(2)
+    c1.metric("Vertici mesh", f"{len(md['verts']):,}")
+    c2.metric("Triangoli", f"{len(md['faces']):,}")
+
     df_3d = st.session_state.cropped_df if st.session_state.cropped_df is not None else df_filtered
     with st.expander("🔎 Anteprima dati"):
         st.dataframe(df_3d.head(200), use_container_width=True)
