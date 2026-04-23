@@ -291,41 +291,40 @@ def reconstruct(cloud: pv.PolyData, lod: int, method: str) -> pv.PolyData:
     return surf
 
 
-def show_pyvista(plotter: pv.Plotter, height: int = 650) -> None:
+def generate_3d_html(
+    points: np.ndarray,
+    rgb: np.ndarray | None,
+    lod: int,
+    method: str,
+    show_points: bool,
+    max_points: int = 60_000,
+    max_cells: int = 120_000,
+) -> str:
     """
-    Embed del plotter come HTML standalone (VTK.js via trame).
-    Non usa multiprocessing → funziona su Streamlit Cloud.
+    Pipeline completo: PolyData → superficie → HTML standalone VTK.js.
+    - Downsample input a `max_points` per tenere la RAM sotto controllo.
+    - Decimation automatica se la mesh supera `max_cells` celle.
     """
-    tmp_path = None
-    html_str = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
-            tmp_path = f.name
-        plotter.export_html(tmp_path)
-        with open(tmp_path, "r", encoding="utf-8") as fh:
-            html_str = fh.read()
-    except Exception as e:
-        st.warning(f"Rendering interattivo non disponibile ({e}); fallback a immagine statica.")
-        try:
-            img = plotter.screenshot(return_img=True, window_size=[900, height])
-            st.image(img, use_container_width=True)
-        except Exception as e2:
-            st.error(f"Rendering fallito: {e2}")
-    finally:
-        if tmp_path:
-            try: os.unlink(tmp_path)
-            except OSError: pass
-        try: plotter.close()
-        except Exception: pass
+    # Downsample duro dei punti in ingresso (protegge da OOM)
+    if len(points) > max_points:
+        idx = np.random.default_rng(42).choice(len(points), max_points, replace=False)
+        points = points[idx]
+        if rgb is not None:
+            rgb = rgb[idx]
 
-    if html_str is not None:
-        components.html(html_str, height=height + 20, scrolling=False)
+    cloud = pv.PolyData(points.astype(np.float32))
+    if rgb is not None:
+        cloud["RGB"] = rgb.astype(np.uint8)
 
-
-def build_plotter(df: pd.DataFrame, lod: int, method: str, show_points: bool) -> pv.Plotter:
-    """Plotter PyVista con shading e illuminazione per look CAD."""
-    cloud = build_cloud(df)
     surf = reconstruct(cloud, lod, method)
+
+    # Decima la mesh se è troppo densa per l'export HTML
+    if surf.n_cells > max_cells:
+        try:
+            ratio = 1.0 - (max_cells / surf.n_cells)
+            surf = surf.decimate(ratio)
+        except Exception:
+            pass
 
     pl = pv.Plotter(window_size=[900, 650], off_screen=True)
     pl.set_background("#0E1117")
@@ -333,27 +332,40 @@ def build_plotter(df: pd.DataFrame, lod: int, method: str, show_points: bool) ->
     if surf.n_cells > 0:
         pl.add_mesh(
             surf,
-            color="#B8C4D6",          # grigio-azzurro architettonico
+            color="#B8C4D6",
             smooth_shading=True,
-            specular=0.4,
-            specular_power=20,
-            ambient=0.25,
-            diffuse=0.75,
-            show_edges=False,
-            lighting=True,
+            specular=0.4, specular_power=20,
+            ambient=0.25, diffuse=0.75,
+            show_edges=False, lighting=True,
         )
     else:
-        # fallback a nuvola se la ricostruzione fallisce
         pl.add_mesh(cloud, color="#B8C4D6", point_size=3, render_points_as_spheres=True)
 
     if show_points:
         pl.add_mesh(cloud, color="#00E5FF", point_size=1.5,
                     render_points_as_spheres=True, opacity=0.6)
 
-    pl.enable_eye_dome_lighting()  # depth cue senza costo
+    pl.enable_eye_dome_lighting()
     pl.add_light(pv.Light(position=(1, 1, 1), intensity=0.6, light_type="scene light"))
     pl.view_isometric()
-    return pl
+
+    # Export HTML (VTK.js) senza subprocess
+    tmp_path = None
+    html_str = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            tmp_path = f.name
+        pl.export_html(tmp_path)
+        with open(tmp_path, "r", encoding="utf-8") as fh:
+            html_str = fh.read()
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+        try: pl.close()
+        except Exception: pass
+
+    return html_str
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +376,7 @@ def _init_state():
     ss.setdefault("current_file", None)
     ss.setdefault("cropped_df", None)
     ss.setdefault("last_selection", None)
+    ss.setdefault("mesh_html", None)
 
 _init_state()
 
@@ -422,6 +435,7 @@ if st.session_state.current_file != file_id:
     st.session_state.current_file = file_id
     st.session_state.cropped_df = None
     st.session_state.last_selection = None
+    st.session_state.mesh_html = None
 
 # Parsing
 ext = Path(uploaded.name).suffix.lower()
@@ -542,21 +556,47 @@ with right:
 
     st.markdown("")
     confirm = st.button(
-        "✅ Conferma Selezione e Ritaglia 3D",
+        "✅ Conferma Selezione e Genera 3D",
         type="primary",
         disabled=selection is None,
         use_container_width=True,
     )
-    if st.button("↩️ Reset vista 3D", use_container_width=True):
+    gen_full = st.button(
+        "🏛️ Genera 3D (tutta la nuvola)",
+        use_container_width=True,
+        help="Genera il modello 3D senza ritagliare.",
+    )
+    if st.button("↩️ Reset", use_container_width=True):
         st.session_state.cropped_df = None
+        st.session_state.mesh_html = None
 
+    # Logica di generazione
+    source_df = None
     if confirm and selection is not None:
         cropped = crop_by_selection(df_filtered, selection)
         if cropped.empty:
             st.error("Nessun punto nella selezione.")
         else:
             st.session_state.cropped_df = cropped
+            source_df = cropped
             st.success(f"Ritagliati {len(cropped):,} punti.")
+    elif gen_full:
+        source_df = df_filtered
+
+    if source_df is not None:
+        with st.spinner(f"Ricostruzione superficie su {len(source_df):,} punti..."):
+            try:
+                pts = source_df[["X", "Y", "Z"]].to_numpy(dtype=np.float32)
+                has_rgb = {"R", "G", "B"}.issubset(source_df.columns)
+                rgb = source_df[["R", "G", "B"]].to_numpy(dtype=np.uint8) if has_rgb else None
+                html = generate_3d_html(
+                    points=pts, rgb=rgb,
+                    lod=lod, method=method, show_points=show_points,
+                )
+                st.session_state.mesh_html = html
+            except Exception as e:
+                st.error(f"Errore nella ricostruzione 3D: {e}")
+                st.session_state.mesh_html = None
 
 # =========================================================================
 # STEP 2 — VISTA 3D RICOSTRUITA
@@ -564,16 +604,13 @@ with right:
 st.markdown("---")
 st.subheader("🏛️ Modello 3D ricostruito")
 
-df_3d = st.session_state.cropped_df if st.session_state.cropped_df is not None else df_filtered
-
-if len(df_3d) > 200_000:
-    st.info(f"Downsample automatico da {len(df_3d):,} a 200.000 punti per la ricostruzione.")
-    df_3d = df_3d.sample(200_000, random_state=42).reset_index(drop=True)
-
-with st.spinner("Ricostruzione superficie..."):
-    plotter = build_plotter(df_3d, lod=lod, method=method, show_points=show_points)
-
-show_pyvista(plotter, height=650)
-
-with st.expander("🔎 Anteprima dati ritagliati"):
-    st.dataframe(df_3d.head(200), use_container_width=True)
+if st.session_state.mesh_html:
+    components.html(st.session_state.mesh_html, height=670, scrolling=False)
+    df_3d = st.session_state.cropped_df if st.session_state.cropped_df is not None else df_filtered
+    with st.expander("🔎 Anteprima dati"):
+        st.dataframe(df_3d.head(200), use_container_width=True)
+else:
+    st.info(
+        "👉 Seleziona un'area e clicca **Conferma Selezione e Genera 3D**, "
+        "oppure **Genera 3D (tutta la nuvola)** per ricostruire il modello."
+    )
