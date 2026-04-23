@@ -19,17 +19,36 @@ from PIL import Image
 from stpyvista import stpyvista
 
 # --- Compat shim per streamlit-drawable-canvas su Streamlit >= 1.40 ---
-# image_to_url è stata spostata da streamlit.elements.image a
-# streamlit.elements.lib.image_utils. Il componente non è aggiornato, quindi
-# ricolleghiamo il simbolo nel namespace originale prima dell'import.
+# Non basta rimpiazzare l'import: anche la *firma* di image_to_url è cambiata
+# (ora vuole un layout_config invece di un int width). Qui reimplementiamo
+# la vecchia API in modo autonomo, producendo un data-URL base64 dell'immagine.
+import base64
+from io import BytesIO as _BytesIO
+
+def _legacy_image_to_url(image, width=None, clamp=None, channels="RGB",
+                         output_format="PNG", image_id=None, **_kwargs):
+    """Shim compatibile con la vecchia API image_to_url."""
+    if isinstance(image, Image.Image):
+        pil = image
+    elif isinstance(image, np.ndarray):
+        pil = Image.fromarray(image)
+    elif isinstance(image, (bytes, bytearray)):
+        pil = Image.open(_BytesIO(image))
+    else:
+        pil = Image.open(image)
+    if channels and pil.mode != channels:
+        pil = pil.convert(channels)
+    buf = _BytesIO()
+    fmt = (output_format or "PNG").upper()
+    pil.save(buf, format=fmt)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/{fmt.lower()};base64,{b64}"
+
 try:
     import streamlit.elements.image as _st_image  # type: ignore
-    if not hasattr(_st_image, "image_to_url"):
-        try:
-            from streamlit.elements.lib.image_utils import image_to_url as _img2url
-        except ImportError:
-            from streamlit.elements.lib.image_utils import _image_to_url as _img2url
-        _st_image.image_to_url = _img2url
+    # Installiamo sempre il shim: la firma originale non è più compatibile
+    # con drawable-canvas 0.9.x anche quando il simbolo è ancora esposto.
+    _st_image.image_to_url = _legacy_image_to_url
 except Exception:
     pass
 
