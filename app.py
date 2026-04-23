@@ -33,6 +33,14 @@ if os.name != "nt":
     except Exception:
         pass
 
+# PyVista.export_html() → trame → asyncio. Streamlit non gira in un event loop
+# jupyter-like, quindi serve nest_asyncio per permettere il launch del server trame.
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # CONFIG PAGINA
@@ -349,7 +357,7 @@ def generate_3d_html(
     pl.add_light(pv.Light(position=(1, 1, 1), intensity=0.6, light_type="scene light"))
     pl.view_isometric()
 
-    # Export HTML (VTK.js) senza subprocess
+    # Export HTML (VTK.js). Se fallisce (trame/asyncio), fallback a screenshot statico.
     tmp_path = None
     html_str = ""
     try:
@@ -358,6 +366,23 @@ def generate_3d_html(
         pl.export_html(tmp_path)
         with open(tmp_path, "r", encoding="utf-8") as fh:
             html_str = fh.read()
+    except Exception:
+        # Fallback: PNG base64 incapsulato in HTML
+        try:
+            import base64 as _b64
+            img = pl.screenshot(return_img=True, window_size=[900, 650])
+            from io import BytesIO as _BIO
+            from PIL import Image as _PILImg  # pillow arriva con pyvista/streamlit
+            buf = _BIO()
+            _PILImg.fromarray(img).save(buf, format="PNG")
+            b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+            html_str = (
+                f'<div style="background:#0E1117;text-align:center;padding:10px;">'
+                f'<img src="data:image/png;base64,{b64}" '
+                f'style="max-width:100%;height:auto;"/></div>'
+            )
+        except Exception as e:
+            html_str = f'<div style="color:#FAFAFA;padding:20px;">Rendering fallito: {e}</div>'
     finally:
         if tmp_path:
             try: os.unlink(tmp_path)
