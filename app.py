@@ -17,7 +17,23 @@ import pyvista as pv
 import streamlit as st
 from PIL import Image
 from stpyvista import stpyvista
-from streamlit_drawable_canvas import st_canvas
+
+# --- Compat shim per streamlit-drawable-canvas su Streamlit >= 1.40 ---
+# image_to_url è stata spostata da streamlit.elements.image a
+# streamlit.elements.lib.image_utils. Il componente non è aggiornato, quindi
+# ricolleghiamo il simbolo nel namespace originale prima dell'import.
+try:
+    import streamlit.elements.image as _st_image  # type: ignore
+    if not hasattr(_st_image, "image_to_url"):
+        try:
+            from streamlit.elements.lib.image_utils import image_to_url as _img2url
+        except ImportError:
+            from streamlit.elements.lib.image_utils import _image_to_url as _img2url
+        _st_image.image_to_url = _img2url
+except Exception:
+    pass
+
+from streamlit_drawable_canvas import st_canvas  # noqa: E402
 
 # CAD loaders opzionali
 try:
