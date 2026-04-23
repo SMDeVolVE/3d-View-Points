@@ -15,8 +15,8 @@ import numpy as np
 import pandas as pd
 import pyvista as pv
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
-from stpyvista import stpyvista
 
 # --- Compat shim per streamlit-drawable-canvas su Streamlit >= 1.40 ---
 # Non basta rimpiazzare l'import: anche la *firma* di image_to_url è cambiata
@@ -368,6 +368,37 @@ def reconstruct(cloud: pv.PolyData, lod: int, method: str) -> pv.PolyData:
     return surf
 
 
+def show_pyvista(plotter: pv.Plotter, height: int = 650) -> None:
+    """
+    Embed del plotter come HTML standalone (VTK.js via trame).
+    Non usa multiprocessing → funziona su Streamlit Cloud.
+    """
+    tmp_path = None
+    html_str = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            tmp_path = f.name
+        plotter.export_html(tmp_path)
+        with open(tmp_path, "r", encoding="utf-8") as fh:
+            html_str = fh.read()
+    except Exception as e:
+        st.warning(f"Rendering interattivo non disponibile ({e}); fallback a immagine statica.")
+        try:
+            img = plotter.screenshot(return_img=True, window_size=[900, height])
+            st.image(img, use_container_width=True)
+        except Exception as e2:
+            st.error(f"Rendering fallito: {e2}")
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+        try: plotter.close()
+        except Exception: pass
+
+    if html_str is not None:
+        components.html(html_str, height=height + 20, scrolling=False)
+
+
 def build_plotter(df: pd.DataFrame, lod: int, method: str, show_points: bool) -> pv.Plotter:
     """Plotter PyVista con shading e illuminazione per look CAD."""
     cloud = build_cloud(df)
@@ -594,7 +625,7 @@ if len(df_3d) > 200_000:
 with st.spinner("Ricostruzione superficie..."):
     plotter = build_plotter(df_3d, lod=lod, method=method, show_points=show_points)
 
-stpyvista(plotter, key=f"pv_{file_id}_{len(df_3d)}_{lod}_{method}")
+show_pyvista(plotter, height=650)
 
 with st.expander("🔎 Anteprima dati ritagliati"):
     st.dataframe(df_3d.head(200), use_container_width=True)
