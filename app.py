@@ -354,6 +354,181 @@ def _concave_hull_2d(xy: np.ndarray, alpha_factor: float = 3.0) -> np.ndarray:
     return xy[loop]
 
 
+def extrude_rectangular_building(
+    points: np.ndarray,
+    floor_height: float = 3.0,
+    window_w: float = 1.2,
+    window_h: float = 1.5,
+    window_spacing: float = 3.5,
+    window_margin_side: float = 1.0,
+    window_margin_top: float = 0.6,
+    add_windows: bool = True,
+) -> dict:
+    """
+    Ricostruzione rettangolare (Minimum Bounding Rectangle via PCA):
+      1. PCA sui punti del corpo dell'edificio → orientamento principale
+      2. Bounding rectangle orientato (robusto via percentili 2/98)
+      3. Estrusione verticale → prisma rettangolare
+      4. Griglia di finestre procedurali sui muri
+    Ritorna dict: {walls, roof, floor, [windows]}.
+    """
+    if len(points) < 10:
+        return {}
+
+    z_sorted = np.sort(points[:, 2])
+    z_floor = float(z_sorted[int(0.02 * (len(z_sorted) - 1))])
+    z_roof = float(z_sorted[int(0.98 * (len(z_sorted) - 1))])
+    if z_roof - z_floor < 1e-6:
+        return {}
+
+    # Usa punti del corpo (esclude terreno) per orientare il rettangolo
+    z_thresh = z_floor + (z_roof - z_floor) * 0.35
+    body = points[points[:, 2] > z_thresh]
+    if len(body) < 20:
+        body = points
+    xy = body[:, :2].astype(np.float64)
+
+    # PCA per trovare l'orientamento
+    center_xy = xy.mean(axis=0)
+    centered = xy - center_xy
+    if len(centered) > 3000:
+        idx = np.random.default_rng(0).choice(len(centered), 3000, replace=False)
+        cov = np.cov(centered[idx].T)
+    else:
+        cov = np.cov(centered.T)
+    _, eigvecs = np.linalg.eigh(cov)
+    axes = eigvecs  # 2x2: colonne = autovettori (assi principali)
+
+    # Proietta sugli assi, prendi min/max robusti (2°/98° percentile)
+    projected = centered @ axes
+    pmin = np.percentile(projected, 2, axis=0)
+    pmax = np.percentile(projected, 98, axis=0)
+
+    # Protezione anti-degenere: se una dimensione è < 1% dell'altra,
+    # la allarga in modo che il rettangolo abbia un rapporto sensato.
+    dims = pmax - pmin
+    if dims.max() > 0:
+        min_ratio = 0.10
+        target = dims.max() * min_ratio
+        for k in range(2):
+            if dims[k] < target:
+                pad = (target - dims[k]) / 2
+                pmin[k] -= pad
+                pmax[k] += pad
+
+    # 4 corner in coord principali → riporta in world
+    corners_p = np.array([
+        [pmin[0], pmin[1]],
+        [pmax[0], pmin[1]],
+        [pmax[0], pmax[1]],
+        [pmin[0], pmax[1]],
+    ])
+    corners = (corners_p @ axes.T + center_xy).astype(np.float32)
+    bcenter = corners.mean(axis=0)
+
+    n = 4
+    total_h = z_roof - z_floor
+    n_floors = max(1, int(round(total_h / floor_height)))
+    actual_floor_h = total_h / n_floors  # stira i piani per coprire esattamente
+
+    # --- MURI: 4 quad con vertici duplicati (flat shading pulito) ---
+    wall_v = np.zeros((4 * n, 3), dtype=np.float32)
+    wall_f = np.zeros((2 * n, 3), dtype=np.int32)
+    wall_meta = []  # (p0, p1, wdir, normal, wall_length) per il posizionamento finestre
+
+    for i in range(n):
+        j = (i + 1) % n
+        base = 4 * i
+        p0, p1 = corners[i], corners[j]
+        wall_v[base + 0] = [p0[0], p0[1], z_floor]
+        wall_v[base + 1] = [p1[0], p1[1], z_floor]
+        wall_v[base + 2] = [p1[0], p1[1], z_roof]
+        wall_v[base + 3] = [p0[0], p0[1], z_roof]
+        wall_f[2 * i + 0] = [base, base + 1, base + 2]
+        wall_f[2 * i + 1] = [base, base + 2, base + 3]
+
+        wd = p1[:2] - p0[:2]
+        wlen = float(np.linalg.norm(wd))
+        wdir = wd / wlen if wlen > 0 else np.array([1.0, 0.0], dtype=np.float32)
+        # Normale esterna (perpendicolare, orientata verso l'esterno)
+        nrm = np.array([wdir[1], -wdir[0]], dtype=np.float32)
+        edge_mid = (p0[:2] + p1[:2]) / 2
+        if np.dot(nrm, edge_mid - bcenter[:2]) < 0:
+            nrm = -nrm
+        wall_meta.append((p0, p1, wdir, nrm, wlen))
+
+    # --- TETTO: un singolo rettangolo (2 triangoli) ---
+    roof_v = np.array([
+        [corners[0, 0], corners[0, 1], z_roof],
+        [corners[1, 0], corners[1, 1], z_roof],
+        [corners[2, 0], corners[2, 1], z_roof],
+        [corners[3, 0], corners[3, 1], z_roof],
+    ], dtype=np.float32)
+    roof_f = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+
+    # --- PAVIMENTO (winding invertito per normale verso il basso) ---
+    floor_v = np.array([
+        [corners[0, 0], corners[0, 1], z_floor],
+        [corners[1, 0], corners[1, 1], z_floor],
+        [corners[2, 0], corners[2, 1], z_floor],
+        [corners[3, 0], corners[3, 1], z_floor],
+    ], dtype=np.float32)
+    floor_f = np.array([[0, 2, 1], [0, 3, 2]], dtype=np.int32)
+
+    result = {
+        "walls": (wall_v, wall_f),
+        "roof": (roof_v, roof_f),
+        "floor": (floor_v, floor_f),
+    }
+
+    # --- FINESTRE: griglia procedurale piano × posizione ---
+    if add_windows:
+        win_v: list = []
+        win_f: list = []
+        offset = 0.04  # piccolo offset esterno per evitare z-fighting
+
+        for (p0, p1, wdir, nrm, wlen) in wall_meta:
+            available = wlen - 2 * window_margin_side
+            if available < window_w:
+                continue
+            n_win = max(1, int(available / window_spacing))
+            step = available / n_win
+
+            for floor_idx in range(n_floors):
+                f_z = z_floor + floor_idx * actual_floor_h
+                win_z_b = f_z + (actual_floor_h - window_h) / 2
+                win_z_t = win_z_b + window_h
+                if win_z_t > z_roof - window_margin_top:
+                    continue
+
+                for wi in range(n_win):
+                    t_along = window_margin_side + step * (wi + 0.5)
+                    cx = p0[0] + wdir[0] * t_along + nrm[0] * offset
+                    cy = p0[1] + wdir[1] * t_along + nrm[1] * offset
+                    half = window_w / 2
+                    pl_x, pl_y = cx - wdir[0] * half, cy - wdir[1] * half
+                    pr_x, pr_y = cx + wdir[0] * half, cy + wdir[1] * half
+                    base = len(win_v)
+                    win_v.extend([
+                        [pl_x, pl_y, win_z_b],
+                        [pr_x, pr_y, win_z_b],
+                        [pr_x, pr_y, win_z_t],
+                        [pl_x, pl_y, win_z_t],
+                    ])
+                    win_f.extend([
+                        [base, base + 1, base + 2],
+                        [base, base + 2, base + 3],
+                    ])
+
+        if win_v:
+            result["windows"] = (
+                np.asarray(win_v, dtype=np.float32),
+                np.asarray(win_f, dtype=np.int32),
+            )
+
+    return result
+
+
 def extrude_building(points: np.ndarray, lod: int, use_concave: bool = True) -> dict:
     """
     Ricostruzione prismatica di un edificio:
@@ -394,6 +569,13 @@ def extrude_building(points: np.ndarray, lod: int, use_concave: bool = True) -> 
     n = len(footprint)
     if n < 3:
         return {}
+
+    # Protezione anti-degenere: se la bbox del footprint è troppo sottile,
+    # vuol dire che i punti erano quasi collineari → fallback a rettangolo PCA
+    fp_w = float(footprint[:, 0].max() - footprint[:, 0].min())
+    fp_h = float(footprint[:, 1].max() - footprint[:, 1].min())
+    if min(fp_w, fp_h) < 0.05 * max(fp_w, fp_h, 1e-9):
+        return extrude_rectangular_building(points, add_windows=False)
 
     # --- MESH MURI: un quad per ogni edge, vertici separati per flatshading netto
     wall_v = np.zeros((4 * n, 3), dtype=np.float32)
@@ -438,19 +620,33 @@ def reconstruct_mesh_arrays(
     points: np.ndarray,
     lod: int,
     method: str,
+    rect_params: dict | None = None,
     max_points: int = 60_000,
     max_cells: int = 150_000,
 ) -> dict:
     """
     Ritorna un dict {nome_parte: (verts, faces)}.
-    - 'building': parti separate (walls/roof/floor) per look CAD
+    - 'building_rect': rettangolo PCA + finestre procedurali (incarto energia)
+    - 'building_*':    parti separate (walls/roof/floor) per look CAD
     - 'reconstruct_surface' / 'delaunay_2d': unica mesh 'surface'
     """
     if len(points) > max_points:
         idx = np.random.default_rng(42).choice(len(points), max_points, replace=False)
         points = points[idx]
 
-    # --- ESTRUSIONE EDIFICIO ---
+    # --- EDIFICIO RETTANGOLARE IDEALIZZATO (con finestre) ---
+    if method == "building_rect":
+        rp = rect_params or {}
+        return extrude_rectangular_building(
+            points,
+            floor_height=rp.get("floor_height", 3.0),
+            window_w=rp.get("window_w", 1.2),
+            window_h=rp.get("window_h", 1.5),
+            window_spacing=rp.get("window_spacing", 3.5),
+            add_windows=rp.get("add_windows", True),
+        )
+
+    # --- ESTRUSIONE EDIFICIO (footprint reale) ---
     if method in ("building_convex", "building_concave"):
         return extrude_building(
             points, lod=lod, use_concave=(method == "building_concave")
@@ -481,8 +677,9 @@ def reconstruct_mesh_arrays(
 # Palette CAD architettonica (light theme come da riferimento)
 _PART_COLORS = {
     "walls":   "#C9CCD1",   # muri grigio chiaro
-    "roof":    "#8B6F47",   # tetto marrone
+    "roof":    "#6B5A3E",   # tetto marrone piatto
     "floor":   "#3D3D3D",   # pavimento scuro (raramente visibile)
+    "windows": "#7DA9D1",   # finestre azzurro vetro
     "surface": "#B8C4D6",   # superficie organica (fallback)
 }
 
@@ -538,8 +735,8 @@ def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
             continue
         any_mesh = True
         color = _PART_COLORS.get(name, "#B8C4D6")
-        # Pavimento non mostra gli edge (inutile)
-        edges = show_edges and name != "floor"
+        # Pavimento e finestre non mostrano gli edge (rumore visivo)
+        edges = show_edges and name not in ("floor", "windows")
         for tr in _mesh_trace(v, f, color, flatshading=True, show_edges=edges):
             fig.add_trace(tr)
 
@@ -617,6 +814,7 @@ with st.sidebar:
     lod = st.slider("Livello di Dettaglio", 1, 10, 5,
                     help="Più alto = superficie più fine (ma più lento).")
     _method_labels = {
+        "building_rect":    "🏠 Edificio Rettangolare + Finestre",
         "building_concave": "🏛️ Estrusione Edificio (concave)",
         "building_convex":  "🏛️ Estrusione Edificio (convex)",
         "reconstruct_surface": "Reconstruct Surface (VTK)",
@@ -628,11 +826,31 @@ with st.sidebar:
         format_func=lambda x: _method_labels[x],
         index=0,
         help=(
-            "**Estrusione Edificio** → look CAD pulito (muri, tetto, pavimento separati).\n"
+            "**Edificio Rettangolare + Finestre** → modello idealizzato con muri "
+            "dritti, tetto piatto e griglia di finestre (per incarto energia).\n"
+            "**Estrusione Edificio** → look CAD pulito con footprint reale.\n"
             "**Reconstruct Surface** → superficie organica continua.\n"
             "**Delaunay 2.5D** → superficie aderente ai punti, buona per terreni."
         ),
     )
+
+    # Parametri specifici per edificio rettangolare (incarto energia)
+    rect_params: dict = {}
+    if method == "building_rect":
+        st.markdown("**🏠 Parametri edificio**")
+        rect_params["floor_height"] = st.slider(
+            "Altezza piano (m)", 2.2, 5.0, 3.0, 0.1,
+            help="Altezza di interpiano usata per posizionare le finestre.",
+        )
+        rect_params["add_windows"] = st.checkbox("Aggiungi finestre", value=True)
+        if rect_params["add_windows"]:
+            rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
+            rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
+            rect_params["window_spacing"] = st.slider(
+                "Passo orizzontale (m)", 2.0, 8.0, 3.5, 0.1,
+                help="Distanza tipica tra finestre: l'algoritmo le distribuisce uniformi.",
+            )
+
     theme = st.radio("Tema 3D", ["light", "dark"], horizontal=True,
                      format_func=lambda x: "Chiaro (CAD)" if x == "light" else "Scuro")
     show_edges = st.checkbox("Mostra spigoli (wireframe)", value=True)
@@ -821,7 +1039,19 @@ with right:
                 pts = source_df[["X", "Y", "Z"]].to_numpy(dtype=np.float32)
                 mesh_parts = reconstruct_mesh_arrays(
                     points=pts, lod=lod, method=method,
+                    rect_params=rect_params,
                 )
+                # Diagnostica: mesh quasi degenere?
+                all_v = [v for v, _ in mesh_parts.values() if len(v) > 0]
+                if all_v:
+                    stacked = np.concatenate(all_v, axis=0)
+                    extent = stacked.max(axis=0) - stacked.min(axis=0)
+                    if extent.max() > 0 and extent.min() < 0.02 * extent.max():
+                        st.warning(
+                            "⚠️ Geometria molto sottile: la nuvola è anisotropa. "
+                            "Prova il metodo **🏠 Edificio Rettangolare + Finestre** "
+                            "per ottenere un volume coerente."
+                        )
                 st.session_state.mesh_data = {
                     "parts": mesh_parts,
                     "points": pts if show_points else None,
