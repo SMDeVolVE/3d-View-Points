@@ -1,14 +1,26 @@
 """
 Point Cloud Viewer - Streamlit Web App
-Carica un file .xyz (nuvola di punti da drone) e visualizza
+Carica un file .xyz / .dxf / .dwg (nuvola di punti) e visualizza
 uno schema 3D interattivo dell'edificio.
 """
 
 import io
+import os
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+# ezdxf è opzionale: se manca, i formati CAD vengono disabilitati con messaggio chiaro
+try:
+    import ezdxf
+    from ezdxf.addons import odafc
+    EZDXF_AVAILABLE = True
+except ImportError:
+    EZDXF_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +124,145 @@ def load_xyz(file_bytes: bytes) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# PARSING FILE DXF / DWG
+# ---------------------------------------------------------------------------
+# Indice AutoCAD → RGB per i 256 colori ACI standard (sottoinsieme comune).
+# ezdxf espone già la conversione via aci2rgb, quindi deleghiamo a lui.
+def _aci_to_rgb(aci: int):
+    try:
+        from ezdxf.colors import aci2rgb
+        return aci2rgb(aci)
+    except Exception:
+        return None
+
+
+def _extract_points_from_doc(doc) -> pd.DataFrame:
+    """
+    Estrae coordinate 3D da un documento ezdxf.
+    Priorità: entità POINT (standard per nuvole). Fallback: vertici di entità 3D
+    comuni (3DFACE, MESH, LINE endpoints, INSERT positions).
+    Colore: true_color se presente, altrimenti color index ACI.
+    """
+    msp = doc.modelspace()
+    rows = []
+
+    for e in msp:
+        dtype = e.dxftype()
+
+        # True color (0xRRGGBB) se impostato
+        rgb = None
+        try:
+            if e.dxf.hasattr("true_color"):
+                tc = e.dxf.true_color
+                rgb = ((tc >> 16) & 0xFF, (tc >> 8) & 0xFF, tc & 0xFF)
+        except Exception:
+            rgb = None
+        if rgb is None:
+            try:
+                rgb = _aci_to_rgb(e.dxf.color)
+            except Exception:
+                rgb = None
+
+        if dtype == "POINT":
+            p = e.dxf.location
+            rows.append((p.x, p.y, p.z, rgb))
+        elif dtype == "LINE":
+            s, en = e.dxf.start, e.dxf.end
+            rows.append((s.x, s.y, s.z, rgb))
+            rows.append((en.x, en.y, en.z, rgb))
+        elif dtype == "3DFACE":
+            for attr in ("vtx0", "vtx1", "vtx2", "vtx3"):
+                try:
+                    v = getattr(e.dxf, attr)
+                    rows.append((v.x, v.y, v.z, rgb))
+                except AttributeError:
+                    pass
+        elif dtype == "MESH":
+            try:
+                for v in e.vertices:
+                    rows.append((v[0], v[1], v[2], rgb))
+            except Exception:
+                pass
+        elif dtype == "INSERT":
+            p = e.dxf.insert
+            rows.append((p.x, p.y, p.z, rgb))
+
+    if not rows:
+        raise ValueError(
+            "Nessun punto trovato nel file CAD. "
+            "Il file deve contenere entità POINT, LINE, 3DFACE, MESH o INSERT nel modelspace."
+        )
+
+    xs, ys, zs, cols = zip(*rows)
+    df = pd.DataFrame({"X": xs, "Y": ys, "Z": zs})
+
+    # Se almeno una entità ha colore valido, aggiungiamo le colonne RGB
+    if any(c is not None for c in cols):
+        r, g, b = [], [], []
+        for c in cols:
+            if c is None:
+                r.append(200); g.append(200); b.append(200)  # grigio default
+            else:
+                r.append(int(c[0])); g.append(int(c[1])); b.append(int(c[2]))
+        df["R"], df["G"], df["B"] = r, g, b
+
+    return df.dropna().reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_dxf(file_bytes: bytes) -> pd.DataFrame:
+    """Carica un file .dxf (ASCII o binary) e ritorna il DataFrame X Y Z [R G B]."""
+    if not EZDXF_AVAILABLE:
+        raise RuntimeError("La libreria ezdxf non è installata. Esegui: pip install ezdxf")
+
+    # ezdxf preferisce un path su disco per essere robusto con DXF binari
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        doc = ezdxf.readfile(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    return _extract_points_from_doc(doc)
+
+
+@st.cache_data(show_spinner=False)
+def load_dwg(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Carica un file .dwg convertendolo prima in DXF tramite ODA File Converter.
+    Richiede che ODA File Converter sia installato sul sistema.
+    """
+    if not EZDXF_AVAILABLE:
+        raise RuntimeError("La libreria ezdxf non è installata. Esegui: pip install ezdxf")
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="dwg2dxf_"))
+    dwg_path = tmpdir / "input.dwg"
+    dwg_path.write_bytes(file_bytes)
+
+    try:
+        # odafc.readfile converte il DWG in DXF in un file temporaneo e lo legge
+        doc = odafc.readfile(str(dwg_path))
+    except odafc.ODAFCError as e:
+        raise RuntimeError(
+            "ODA File Converter non trovato o errore di conversione.\n\n"
+            "Per abilitare il supporto DWG installa **ODA File Converter** (gratuito):\n"
+            "https://www.opendesign.com/guestfiles/oda_file_converter\n\n"
+            f"Dettaglio tecnico: {e}"
+        )
+    finally:
+        try:
+            dwg_path.unlink()
+            tmpdir.rmdir()
+        except OSError:
+            pass
+
+    return _extract_points_from_doc(doc)
+
+
+# ---------------------------------------------------------------------------
 # PLOT 3D
 # ---------------------------------------------------------------------------
 def build_scatter(df: pd.DataFrame, point_size: float, opacity: float) -> go.Figure:
@@ -167,7 +318,7 @@ def build_scatter(df: pd.DataFrame, point_size: float, opacity: float) -> go.Fig
 # UI
 # ---------------------------------------------------------------------------
 st.title("🛰️ Point Cloud Viewer")
-st.caption("Carica un file `.xyz` e visualizza la nuvola di punti 3D in tempo reale.")
+st.caption("Carica un file `.xyz`, `.dxf` o `.dwg` e visualizza la nuvola di punti 3D in tempo reale.")
 
 # Sidebar: controlli visuali
 with st.sidebar:
@@ -182,14 +333,18 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown(
-        "**Formato atteso**: colonne X Y Z, opzionali R G B. "
-        "Delimitatore (spazio/virgola/tab) rilevato automaticamente."
+        "**Formati supportati**\n\n"
+        "- `.xyz` / `.txt` / `.csv` — X Y Z [R G B], delimitatore auto\n"
+        "- `.dxf` — entità POINT / LINE / 3DFACE / MESH / INSERT\n"
+        "- `.dwg` — richiede **ODA File Converter** installato"
     )
+    if not EZDXF_AVAILABLE:
+        st.warning("`ezdxf` non installato: DXF/DWG disabilitati.")
 
 # Area drag & drop
 uploaded = st.file_uploader(
-    "Trascina qui il tuo file .xyz",
-    type=["xyz", "txt", "csv"],
+    "Trascina qui il tuo file (.xyz / .dxf / .dwg)",
+    type=["xyz", "txt", "csv", "dxf", "dwg"],
     accept_multiple_files=False,
 )
 
@@ -197,10 +352,16 @@ if uploaded is None:
     st.info("👆 Carica un file per iniziare.")
     st.stop()
 
-# Parsing
+# Parsing: dispatch in base all'estensione
+ext = Path(uploaded.name).suffix.lower()
 try:
-    with st.spinner("Parsing del file..."):
-        df = load_xyz(uploaded.getvalue())
+    with st.spinner(f"Parsing del file {ext}..."):
+        if ext == ".dxf":
+            df = load_dxf(uploaded.getvalue())
+        elif ext == ".dwg":
+            df = load_dwg(uploaded.getvalue())
+        else:
+            df = load_xyz(uploaded.getvalue())
 except Exception as e:
     st.error(f"Errore nel parsing: {e}")
     st.stop()
