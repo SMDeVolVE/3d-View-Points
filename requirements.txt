@@ -1,5 +1,9 @@
 streamlit>=1.32
 pandas>=2.0
 numpy>=1.24
-plotly>=5.18
+pyvista>=0.43
+stpyvista>=0.1.0
+streamlit-drawable-canvas>=0.9.3
+matplotlib>=3.7
+pillow>=10.0
 ezdxf>=1.3
