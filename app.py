@@ -191,7 +191,8 @@ def load_dwg(file_bytes: bytes) -> pd.DataFrame:
 # VISTA PLANARE (Plotly) — selezione nativa via box/lasso di Streamlit
 # ---------------------------------------------------------------------------
 def build_topdown_plotly(df: pd.DataFrame, dragmode: str = "select",
-                         circle: dict | None = None) -> go.Figure:
+                         circle: dict | None = None,
+                         rect_rotated: dict | None = None) -> go.Figure:
     """Scatter 2D (XY) con tool di selezione Plotly nativi."""
     fig = go.Figure(
         data=go.Scattergl(
@@ -227,6 +228,31 @@ def build_topdown_plotly(df: pd.DataFrame, dragmode: str = "select",
             line=dict(color="#00E5FF", width=2),
             fillcolor="rgba(0, 229, 255, 0.15)",
         )
+    # Overlay rettangolo ruotato (modalità "rect_rotated")
+    if rect_rotated is not None:
+        cx, cy = rect_rotated["cx"], rect_rotated["cy"]
+        w, h = rect_rotated["w"], rect_rotated["h"]
+        theta = np.deg2rad(rect_rotated["angle_deg"])
+        # 4 corner nel frame locale (senso orario)
+        local = np.array([
+            [-w / 2, -h / 2],
+            [ w / 2, -h / 2],
+            [ w / 2,  h / 2],
+            [-w / 2,  h / 2],
+            [-w / 2, -h / 2],  # chiudi
+        ])
+        c, s = np.cos(theta), np.sin(theta)
+        R = np.array([[c, -s], [s, c]])
+        world = local @ R.T + np.array([cx, cy])
+        fig.add_trace(go.Scatter(
+            x=world[:, 0], y=world[:, 1],
+            mode="lines",
+            line=dict(color="#00E5FF", width=2),
+            fill="toself",
+            fillcolor="rgba(0, 229, 255, 0.15)",
+            hoverinfo="skip",
+            showlegend=False,
+        ))
     return fig
 
 
@@ -236,6 +262,17 @@ def crop_by_selection(df: pd.DataFrame, sel: dict) -> pd.DataFrame:
             (df["X"].between(sel["x1"], sel["x2"])) &
             (df["Y"].between(sel["y1"], sel["y2"]))
         )
+    elif sel["type"] == "rect_rotated":
+        # Ruota i punti nel frame locale del rettangolo, poi test bbox
+        cx, cy = sel["cx"], sel["cy"]
+        w, h = sel["w"], sel["h"]
+        theta = np.deg2rad(sel["angle_deg"])
+        dx = df["X"].to_numpy() - cx
+        dy = df["Y"].to_numpy() - cy
+        c, s = np.cos(-theta), np.sin(-theta)
+        xr = dx * c - dy * s
+        yr = dx * s + dy * c
+        mask = (np.abs(xr) <= w / 2) & (np.abs(yr) <= h / 2)
     elif sel["type"] == "circle":
         dx = df["X"] - sel["cx"]
         dy = df["Y"] - sel["cy"]
@@ -354,6 +391,214 @@ def _concave_hull_2d(xy: np.ndarray, alpha_factor: float = 3.0) -> np.ndarray:
     return xy[loop]
 
 
+def _orthogonalize_polygon(poly: np.ndarray) -> np.ndarray:
+    """
+    Snap-to-grid del perimetro: ruota al frame PCA dominante, forza edge
+    alternati orizzontali/verticali, media le coordinate lungo ogni edge,
+    poi ruota indietro. Output: poligono con tutti gli angoli a 90°.
+    """
+    n = len(poly)
+    if n < 4:
+        return poly.astype(np.float32)
+
+    center = poly.mean(axis=0)
+    centered = poly - center
+    cov = np.cov(centered.T)
+    _, vecs = np.linalg.eigh(cov)
+    principal = vecs[:, -1]
+    theta = np.arctan2(principal[1], principal[0])
+    # riduci al primo quadrante: vogliamo un angolo di rotazione "piccolo"
+    theta = (theta + np.pi / 4) % (np.pi / 2) - np.pi / 4
+
+    c, s = np.cos(-theta), np.sin(-theta)
+    R_fwd = np.array([[c, -s], [s, c]], dtype=np.float64)
+    rotated = centered @ R_fwd.T
+
+    # classifica ogni edge come orizzontale (y-costante) o verticale
+    edge_h = np.zeros(n, dtype=bool)
+    for i in range(n):
+        dx = rotated[(i + 1) % n, 0] - rotated[i, 0]
+        dy = rotated[(i + 1) % n, 1] - rotated[i, 1]
+        edge_h[i] = abs(dx) >= abs(dy)
+
+    # forza alternanza: se due edge adiacenti hanno stesso tipo, flippa il più corto
+    for _pass in range(3):
+        changed = False
+        for i in range(n):
+            if edge_h[i] == edge_h[(i + 1) % n]:
+                li = np.hypot(rotated[(i + 1) % n, 0] - rotated[i, 0],
+                              rotated[(i + 1) % n, 1] - rotated[i, 1])
+                j = (i + 1) % n
+                lj = np.hypot(rotated[(j + 1) % n, 0] - rotated[j, 0],
+                              rotated[(j + 1) % n, 1] - rotated[j, 1])
+                if lj <= li:
+                    edge_h[j] = not edge_h[j]
+                else:
+                    edge_h[i] = not edge_h[i]
+                changed = True
+        if not changed:
+            break
+
+    snapped = rotated.copy()
+    for i in range(n):
+        j = (i + 1) % n
+        if edge_h[i]:
+            avg_y = (rotated[i, 1] + rotated[j, 1]) / 2
+            snapped[i, 1] = avg_y
+            snapped[j, 1] = avg_y
+        else:
+            avg_x = (rotated[i, 0] + rotated[j, 0]) / 2
+            snapped[i, 0] = avg_x
+            snapped[j, 0] = avg_x
+
+    # rimuovi vertici duplicati/collineari
+    cleaned = [snapped[0]]
+    for k in range(1, n):
+        if np.linalg.norm(snapped[k] - cleaned[-1]) > 1e-4:
+            cleaned.append(snapped[k])
+    cleaned = np.array(cleaned)
+    # se primo e ultimo coincidono, eliminane uno
+    if len(cleaned) > 3 and np.linalg.norm(cleaned[0] - cleaned[-1]) < 1e-4:
+        cleaned = cleaned[:-1]
+    if len(cleaned) < 4:
+        return poly.astype(np.float32)
+
+    c2, s2 = np.cos(theta), np.sin(theta)
+    R_back = np.array([[c2, -s2], [s2, c2]], dtype=np.float64)
+    out = cleaned @ R_back.T + center
+    return out.astype(np.float32)
+
+
+def _segment_heights(points: np.ndarray, z_floor: float, z_roof: float,
+                     max_blocks: int = 3, min_gap_frac: float = 0.08
+                     ) -> list[tuple[float, np.ndarray]]:
+    """
+    Rileva quote di gronda distinte (piani sfalsati) e restituisce una
+    lista di blocchi (z_top, xy_points_of_that_block) ordinata per z_top
+    crescente. Ogni blocco contiene i punti che appartengono a quella quota.
+    """
+    total_h = z_roof - z_floor
+    if total_h < 1e-6 or len(points) < 30:
+        body = points[points[:, 2] > z_floor + 0.35 * total_h]
+        if len(body) < 10:
+            body = points
+        return [(z_roof, body[:, :2])]
+
+    # restringi al "corpo" dell'edificio, escludendo il terreno
+    body = points[points[:, 2] > z_floor + 0.35 * total_h]
+    if len(body) < 30:
+        return [(z_roof, body[:, :2] if len(body) else points[:, :2])]
+
+    z_vals = body[:, 2]
+    bins = max(20, min(60, int(total_h * 3)))
+    hist, edges = np.histogram(z_vals, bins=bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    try:
+        from scipy.signal import find_peaks
+        min_distance = max(2, int(bins * min_gap_frac))
+        peaks, _ = find_peaks(
+            hist,
+            height=max(len(body) * 0.015, 3),
+            distance=min_distance,
+        )
+    except Exception:
+        peaks = np.array([], dtype=int)
+
+    if len(peaks) == 0:
+        return [(z_roof, body[:, :2])]
+
+    # top-N picchi per altezza di histogram (più densi = più importanti)
+    order = np.argsort(hist[peaks])[::-1][:max_blocks]
+    peak_z = sorted(float(centers[peaks[i]]) for i in order)
+
+    blocks = []
+    tol = total_h * 0.06
+    for pz in peak_z:
+        mask = np.abs(body[:, 2] - pz) < tol
+        pts_xy = body[mask][:, :2]
+        if len(pts_xy) >= 10:
+            blocks.append((pz, pts_xy))
+
+    if not blocks:
+        blocks = [(z_roof, body[:, :2])]
+    return blocks
+
+
+def _inset_polygon(poly: np.ndarray, inset: float) -> np.ndarray:
+    """
+    Offset pseudo-interno: ogni vertice viene spinto verso il centroide
+    di una quantità `inset`. Sufficiente per l'effetto "tetto rientrato".
+    """
+    if len(poly) < 3 or inset <= 0:
+        return poly
+    center = poly.mean(axis=0)
+    direction = center - poly
+    norms = np.linalg.norm(direction, axis=1, keepdims=True)
+    unit = direction / np.maximum(norms, 1e-9)
+    return (poly + unit * inset).astype(np.float32)
+
+
+def _decimate_parts(parts: dict, ratio: float = 0.9, min_faces: int = 500) -> dict:
+    """
+    Decima ogni mesh con PyVista (riduzione % triangoli) prima di passare
+    a Plotly. I pezzi già leggeri (muri prismatici) vengono saltati.
+    """
+    if ratio <= 0:
+        return parts
+    out = {}
+    for name, (v, f) in parts.items():
+        if len(f) < min_faces:
+            out[name] = (v, f)
+            continue
+        try:
+            faces_pv = np.hstack(
+                [np.full((len(f), 1), 3, dtype=np.int64), f.astype(np.int64)]
+            ).ravel()
+            poly = pv.PolyData(v.astype(np.float32), faces_pv)
+            dec = poly.decimate(ratio)
+            nv = np.asarray(dec.points, dtype=np.float32)
+            nf = dec.faces.reshape(-1, 4)[:, 1:].astype(np.int32) if dec.n_cells > 0 else np.zeros((0, 3), dtype=np.int32)
+            out[name] = (nv, nf) if len(nf) > 0 else (v, f)
+        except Exception:
+            out[name] = (v, f)
+    return out
+
+
+def _window_box(p_center_xy: np.ndarray, wdir: np.ndarray, nrm: np.ndarray,
+                z_bot: float, z_top: float, width: float, depth: float = 0.08
+                ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Box sottile che sporge dalla parete: fronte + 4 lati, normale = `nrm`.
+    Restituisce (vertici, facce) per un singolo davanzale/finestra 3D.
+    """
+    half = width / 2
+    base_l = p_center_xy - wdir * half
+    base_r = p_center_xy + wdir * half
+    front_l = base_l + nrm * depth
+    front_r = base_r + nrm * depth
+    # 8 vertici: 4 sul muro (back) + 4 sulla faccia esterna (front)
+    v = np.array([
+        [base_l[0],  base_l[1],  z_bot],   # 0  back-bot-left
+        [base_r[0],  base_r[1],  z_bot],   # 1  back-bot-right
+        [base_r[0],  base_r[1],  z_top],   # 2  back-top-right
+        [base_l[0],  base_l[1],  z_top],   # 3  back-top-left
+        [front_l[0], front_l[1], z_bot],   # 4  front-bot-left
+        [front_r[0], front_r[1], z_bot],   # 5  front-bot-right
+        [front_r[0], front_r[1], z_top],   # 6  front-top-right
+        [front_l[0], front_l[1], z_top],   # 7  front-top-left
+    ], dtype=np.float32)
+    # facce: fronte + 4 bordi (no retro, già coperto dal muro)
+    f = np.array([
+        [4, 5, 6], [4, 6, 7],      # front
+        [0, 4, 7], [0, 7, 3],      # sinistra
+        [5, 1, 2], [5, 2, 6],      # destra
+        [3, 7, 6], [3, 6, 2],      # sopra
+        [0, 1, 5], [0, 5, 4],      # sotto
+    ], dtype=np.int32)
+    return v, f
+
+
 def extrude_rectangular_building(
     points: np.ndarray,
     floor_height: float = 3.0,
@@ -363,6 +608,7 @@ def extrude_rectangular_building(
     window_margin_side: float = 1.0,
     window_margin_top: float = 0.6,
     add_windows: bool = True,
+    roof_inset: float = 0.1,
 ) -> dict:
     """
     Ricostruzione rettangolare (Minimum Bounding Rectangle via PCA):
@@ -457,12 +703,13 @@ def extrude_rectangular_building(
             nrm = -nrm
         wall_meta.append((p0, p1, wdir, nrm, wlen))
 
-    # --- TETTO: un singolo rettangolo (2 triangoli) ---
+    # --- TETTO: rettangolo leggermente rientrato rispetto al muro ---
+    roof_corners = _inset_polygon(corners.astype(np.float64), roof_inset) if roof_inset > 0 else corners
     roof_v = np.array([
-        [corners[0, 0], corners[0, 1], z_roof],
-        [corners[1, 0], corners[1, 1], z_roof],
-        [corners[2, 0], corners[2, 1], z_roof],
-        [corners[3, 0], corners[3, 1], z_roof],
+        [roof_corners[0, 0], roof_corners[0, 1], z_roof],
+        [roof_corners[1, 0], roof_corners[1, 1], z_roof],
+        [roof_corners[2, 0], roof_corners[2, 1], z_roof],
+        [roof_corners[3, 0], roof_corners[3, 1], z_roof],
     ], dtype=np.float32)
     roof_f = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
 
@@ -481,11 +728,12 @@ def extrude_rectangular_building(
         "floor": (floor_v, floor_f),
     }
 
-    # --- FINESTRE: griglia procedurale piano × posizione ---
+    # --- FINESTRE: box 3D sottili sulle 4 pareti ---
     if add_windows:
-        win_v: list = []
-        win_f: list = []
-        offset = 0.04  # piccolo offset esterno per evitare z-fighting
+        all_v: list[np.ndarray] = []
+        all_f: list[np.ndarray] = []
+        v_offset = 0
+        depth = 0.08  # spessore davanzale (m)
 
         for (p0, p1, wdir, nrm, wlen) in wall_meta:
             available = wlen - 2 * window_margin_side
@@ -503,39 +751,97 @@ def extrude_rectangular_building(
 
                 for wi in range(n_win):
                     t_along = window_margin_side + step * (wi + 0.5)
-                    cx = p0[0] + wdir[0] * t_along + nrm[0] * offset
-                    cy = p0[1] + wdir[1] * t_along + nrm[1] * offset
-                    half = window_w / 2
-                    pl_x, pl_y = cx - wdir[0] * half, cy - wdir[1] * half
-                    pr_x, pr_y = cx + wdir[0] * half, cy + wdir[1] * half
-                    base = len(win_v)
-                    win_v.extend([
-                        [pl_x, pl_y, win_z_b],
-                        [pr_x, pr_y, win_z_b],
-                        [pr_x, pr_y, win_z_t],
-                        [pl_x, pl_y, win_z_t],
-                    ])
-                    win_f.extend([
-                        [base, base + 1, base + 2],
-                        [base, base + 2, base + 3],
-                    ])
+                    c_xy = p0[:2].astype(np.float64) + wdir.astype(np.float64) * t_along
+                    v, f = _window_box(
+                        c_xy, wdir.astype(np.float64), nrm.astype(np.float64),
+                        win_z_b, win_z_t, width=window_w, depth=depth,
+                    )
+                    all_v.append(v)
+                    all_f.append(f + v_offset)
+                    v_offset += len(v)
 
-        if win_v:
+        if all_v:
             result["windows"] = (
-                np.asarray(win_v, dtype=np.float32),
-                np.asarray(win_f, dtype=np.int32),
+                np.concatenate(all_v, axis=0).astype(np.float32),
+                np.concatenate(all_f, axis=0).astype(np.int32),
             )
 
     return result
 
 
-def extrude_building(points: np.ndarray, lod: int, use_concave: bool = True) -> dict:
+def _prism_from_footprint(footprint: np.ndarray, z_bot: float, z_top: float,
+                          roof_inset: float = 0.0
+                          ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Costruisce muri (quad per edge, vertici duplicati per flatshading netto)
+    e tetto (fan dal centroide, con inset opzionale) di un blocco prismatico.
+    Ritorna (wall_v, wall_f, roof_v, roof_f).
+    """
+    n = len(footprint)
+    wall_v = np.zeros((4 * n, 3), dtype=np.float32)
+    wall_f = np.zeros((2 * n, 3), dtype=np.int32)
+    for i in range(n):
+        j = (i + 1) % n
+        base = 4 * i
+        wall_v[base + 0] = [footprint[i, 0], footprint[i, 1], z_bot]
+        wall_v[base + 1] = [footprint[j, 0], footprint[j, 1], z_bot]
+        wall_v[base + 2] = [footprint[j, 0], footprint[j, 1], z_top]
+        wall_v[base + 3] = [footprint[i, 0], footprint[i, 1], z_top]
+        wall_f[2 * i + 0] = [base, base + 1, base + 2]
+        wall_f[2 * i + 1] = [base, base + 2, base + 3]
+
+    roof_poly = _inset_polygon(footprint, roof_inset) if roof_inset > 0 else footprint
+    cx, cy = float(roof_poly[:, 0].mean()), float(roof_poly[:, 1].mean())
+    roof_v = np.zeros((n + 1, 3), dtype=np.float32)
+    roof_v[:n, :2] = roof_poly
+    roof_v[:n, 2] = z_top
+    roof_v[n] = [cx, cy, z_top]
+    roof_f = np.zeros((n, 3), dtype=np.int32)
+    for i in range(n):
+        roof_f[i] = [i, (i + 1) % n, n]
+
+    return wall_v, wall_f, roof_v, roof_f
+
+
+def _footprint_from_xy(xy: np.ndarray, lod: int, use_concave: bool,
+                       orthogonalize: bool) -> np.ndarray | None:
+    """Hull 2D (concave o convex) + eventuale snap-to-grid ortogonale."""
+    if len(xy) < 3:
+        return None
+    if len(xy) > 4000:
+        idx = np.random.default_rng(0).choice(len(xy), 4000, replace=False)
+        xy = xy[idx]
+
+    alpha_factor = max(1.5, 7.0 - 0.55 * lod)
+    if use_concave:
+        fp = _concave_hull_2d(xy.astype(np.float64), alpha_factor=alpha_factor)
+    else:
+        from scipy.spatial import ConvexHull
+        fp = xy[ConvexHull(xy).vertices]
+    if len(fp) < 3:
+        return None
+
+    if orthogonalize:
+        fp = _orthogonalize_polygon(np.asarray(fp, dtype=np.float64))
+    return np.asarray(fp, dtype=np.float32)
+
+
+def extrude_building(points: np.ndarray, lod: int,
+                     use_concave: bool = True,
+                     orthogonalize: bool = False,
+                     multi_height: bool = False,
+                     roof_inset: float = 0.0,
+                     add_windows: bool = False,
+                     window_params: dict | None = None) -> dict:
     """
     Ricostruzione prismatica di un edificio:
-      - ground/roof stimati dai percentili Z
-      - footprint 2D dai punti della metà superiore (concave o convex hull)
-      - estrusione verticale
-    Ritorna dict con mesh separate: 'walls', 'roof', 'floor'.
+      - Z floor/roof stimati da percentili
+      - footprint 2D (concave/convex, eventualmente squadrato a 90°)
+      - segmentazione per altezze opzionale → più blocchi prismatici
+        sovrapposti (piani sfalsati, gronde diverse)
+      - estrusione verticale + tetto (eventualmente rientrato)
+    Ritorna dict con pezzi 'walls', 'roof', 'floor' (eventualmente
+    suffissati '_1', '_2', ... quando multi_height produce più blocchi).
     """
     if len(points) < 10:
         return {}
@@ -546,74 +852,154 @@ def extrude_building(points: np.ndarray, lod: int, use_concave: bool = True) -> 
     if z_roof - z_floor < 1e-6:
         return {}
 
-    # Usa la parte alta per il footprint (esclude terreno/vegetazione bassa)
+    # footprint globale (per pavimento e fallback monoblocco)
     z_thresh = z_floor + (z_roof - z_floor) * 0.35
     body = points[points[:, 2] > z_thresh]
     if len(body) < 20:
         body = points
+    full_fp = _footprint_from_xy(body[:, :2].astype(np.float32),
+                                 lod, use_concave, orthogonalize)
+    if full_fp is None:
+        return extrude_rectangular_building(points, add_windows=False)
 
-    xy = body[:, :2].astype(np.float32)
-    # Downsample hull per velocità
-    if len(xy) > 4000:
-        idx = np.random.default_rng(0).choice(len(xy), 4000, replace=False)
-        xy = xy[idx]
-
-    # LOD: 1..10 → alpha_factor 6..1.5 (alto = conservativo/convex, basso = aderente)
-    alpha_factor = max(1.5, 7.0 - 0.55 * lod)
-    if use_concave:
-        footprint = _concave_hull_2d(xy, alpha_factor=alpha_factor)
-    else:
-        from scipy.spatial import ConvexHull
-        footprint = xy[ConvexHull(xy).vertices]
-
-    n = len(footprint)
-    if n < 3:
-        return {}
-
-    # Protezione anti-degenere: se la bbox del footprint è troppo sottile,
-    # vuol dire che i punti erano quasi collineari → fallback a rettangolo PCA
-    fp_w = float(footprint[:, 0].max() - footprint[:, 0].min())
-    fp_h = float(footprint[:, 1].max() - footprint[:, 1].min())
+    fp_w = float(full_fp[:, 0].max() - full_fp[:, 0].min())
+    fp_h = float(full_fp[:, 1].max() - full_fp[:, 1].min())
     if min(fp_w, fp_h) < 0.05 * max(fp_w, fp_h, 1e-9):
         return extrude_rectangular_building(points, add_windows=False)
 
-    # --- MESH MURI: un quad per ogni edge, vertici separati per flatshading netto
-    wall_v = np.zeros((4 * n, 3), dtype=np.float32)
-    wall_f = np.zeros((2 * n, 3), dtype=np.int32)
-    for i in range(n):
-        j = (i + 1) % n
-        base = 4 * i
-        wall_v[base + 0] = [footprint[i, 0], footprint[i, 1], z_floor]
-        wall_v[base + 1] = [footprint[j, 0], footprint[j, 1], z_floor]
-        wall_v[base + 2] = [footprint[j, 0], footprint[j, 1], z_roof]
-        wall_v[base + 3] = [footprint[i, 0], footprint[i, 1], z_roof]
-        wall_f[2 * i + 0] = [base, base + 1, base + 2]
-        wall_f[2 * i + 1] = [base, base + 2, base + 3]
+    # blocchi per altezza
+    if multi_height:
+        blocks_raw = _segment_heights(points, z_floor, z_roof, max_blocks=3)
+    else:
+        blocks_raw = [(z_roof, body[:, :2])]
 
-    # --- MESH TETTO: triangle-fan dal centroide
-    cx, cy = float(footprint[:, 0].mean()), float(footprint[:, 1].mean())
-    roof_v = np.zeros((n + 1, 3), dtype=np.float32)
-    roof_v[:n, :2] = footprint
-    roof_v[:n, 2] = z_roof
-    roof_v[n] = [cx, cy, z_roof]
-    roof_f = np.zeros((n, 3), dtype=np.int32)
-    for i in range(n):
-        roof_f[i] = [i, (i + 1) % n, n]
+    # costruisci footprint per blocco (quello più basso eredita il full)
+    blocks: list[tuple[float, np.ndarray]] = []
+    for idx, (z_top, xy_block) in enumerate(blocks_raw):
+        fp = _footprint_from_xy(xy_block.astype(np.float32),
+                                lod, use_concave, orthogonalize)
+        if fp is None:
+            fp = full_fp
+        blocks.append((z_top, fp))
 
-    # --- MESH PAVIMENTO: triangle-fan invertito
+    blocks.sort(key=lambda b: b[0])  # crescente per z_top
+
+    # assembla mesh
+    result: dict = {}
+    single = len(blocks) == 1
+    for i, (z_top, fp) in enumerate(blocks):
+        wv, wf, rv, rf = _prism_from_footprint(fp, z_floor, z_top, roof_inset=roof_inset)
+        if single:
+            result["walls"] = (wv, wf)
+            result["roof"] = (rv, rf)
+        else:
+            result[f"walls_{i+1}"] = (wv, wf)
+            result[f"roof_{i+1}"] = (rv, rf)
+
+    # pavimento (una sola mesh, sul footprint più esterno)
+    n = len(full_fp)
+    cx, cy = float(full_fp[:, 0].mean()), float(full_fp[:, 1].mean())
     floor_v = np.zeros((n + 1, 3), dtype=np.float32)
-    floor_v[:n, :2] = footprint
+    floor_v[:n, :2] = full_fp
     floor_v[:n, 2] = z_floor
     floor_v[n] = [cx, cy, z_floor]
     floor_f = np.zeros((n, 3), dtype=np.int32)
     for i in range(n):
-        floor_f[i] = [(i + 1) % n, i, n]  # winding invertito
+        floor_f[i] = [(i + 1) % n, i, n]
+    result["floor"] = (floor_v, floor_f)
 
-    return {
-        "walls": (wall_v, wall_f),
-        "roof": (roof_v, roof_f),
-        "floor": (floor_v, floor_f),
-    }
+    # finestre sulle pareti esterne principali (solo sul blocco più alto)
+    if add_windows and len(full_fp) >= 4:
+        wp = window_params or {}
+        z_top_highest = blocks[-1][0]
+        win_v, win_f = _windows_on_footprint(
+            full_fp, z_floor, z_top_highest,
+            floor_height=wp.get("floor_height", 3.0),
+            window_w=wp.get("window_w", 1.2),
+            window_h=wp.get("window_h", 1.5),
+            window_spacing=wp.get("window_spacing", 3.5),
+            window_margin_side=wp.get("window_margin_side", 1.0),
+            window_margin_top=wp.get("window_margin_top", 0.6),
+            depth=wp.get("window_depth", 0.08),
+            min_wall_frac=wp.get("min_wall_frac", 0.25),
+        )
+        if len(win_v) > 0:
+            result["windows"] = (win_v, win_f)
+
+    return result
+
+
+def _windows_on_footprint(footprint: np.ndarray, z_floor: float, z_roof: float,
+                          floor_height: float, window_w: float, window_h: float,
+                          window_spacing: float, window_margin_side: float,
+                          window_margin_top: float, depth: float,
+                          min_wall_frac: float
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Distribuisce finestre 3D (box sottili) SOLO sulle pareti esterne principali
+    (pareti la cui lunghezza supera `min_wall_frac` * edge più lungo).
+    """
+    n = len(footprint)
+    total_h = z_roof - z_floor
+    n_floors = max(1, int(round(total_h / floor_height)))
+    actual_floor_h = total_h / n_floors
+
+    centroid = footprint.mean(axis=0)
+
+    # calcola lunghezze e filtra solo le principali
+    edges = []
+    for i in range(n):
+        j = (i + 1) % n
+        p0 = footprint[i].astype(np.float64)
+        p1 = footprint[j].astype(np.float64)
+        wd = p1 - p0
+        wlen = float(np.linalg.norm(wd))
+        if wlen < 1e-3:
+            continue
+        wdir = wd / wlen
+        nrm = np.array([wdir[1], -wdir[0]])
+        if np.dot(nrm, (p0 + p1) / 2 - centroid) < 0:
+            nrm = -nrm
+        edges.append((p0, p1, wdir, nrm, wlen))
+
+    if not edges:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32)
+
+    max_len = max(e[4] for e in edges)
+    main_edges = [e for e in edges if e[4] >= max_len * min_wall_frac]
+
+    all_v: list[np.ndarray] = []
+    all_f: list[np.ndarray] = []
+    v_offset = 0
+    for (p0, p1, wdir, nrm, wlen) in main_edges:
+        available = wlen - 2 * window_margin_side
+        if available < window_w:
+            continue
+        n_win = max(1, int(available / window_spacing))
+        step = available / n_win
+
+        for floor_idx in range(n_floors):
+            f_z = z_floor + floor_idx * actual_floor_h
+            win_z_b = f_z + (actual_floor_h - window_h) / 2
+            win_z_t = win_z_b + window_h
+            if win_z_t > z_roof - window_margin_top:
+                continue
+
+            for wi in range(n_win):
+                t_along = window_margin_side + step * (wi + 0.5)
+                c_xy = p0 + wdir * t_along
+                v, f = _window_box(c_xy, wdir, nrm, win_z_b, win_z_t,
+                                   width=window_w, depth=depth)
+                all_v.append(v)
+                all_f.append(f + v_offset)
+                v_offset += len(v)
+
+    if not all_v:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32)
+    return (
+        np.concatenate(all_v, axis=0).astype(np.float32),
+        np.concatenate(all_f, axis=0).astype(np.int32),
+    )
 
 
 def reconstruct_mesh_arrays(
@@ -621,76 +1007,162 @@ def reconstruct_mesh_arrays(
     lod: int,
     method: str,
     rect_params: dict | None = None,
+    decimate_ratio: float = 0.9,
     max_points: int = 60_000,
     max_cells: int = 150_000,
 ) -> dict:
     """
-    Ritorna un dict {nome_parte: (verts, faces)}.
-    - 'building_rect': rettangolo PCA + finestre procedurali (incarto energia)
-    - 'building_*':    parti separate (walls/roof/floor) per look CAD
-    - 'reconstruct_surface' / 'delaunay_2d': unica mesh 'surface'
+    Ritorna un dict {nome_parte: (verts, faces)} con mesh CAD pronte per Plotly.
+
+    Metodi disponibili:
+      - 'building_rect':     rettangolo MBR (PCA) + finestre procedurali 3D
+      - 'building_squared':  concave hull → orthogonalize 90° + piani sfalsati
+      - 'building_concave':  concave hull grezzo (profilo reale, angoli liberi)
+      - 'building_convex':   bounding convex hull
+      - 'reconstruct_surface'/'delaunay_2d': superficie organica unica
+
+    `decimate_ratio` applica PyVista.decimate(ratio) PRIMA di inviare a Plotly.
+    Per le mesh prismatiche l'effetto è nullo (già leggere); per le superfici
+    organiche riduce drasticamente il conteggio triangoli evitando crash.
     """
     if len(points) > max_points:
         idx = np.random.default_rng(42).choice(len(points), max_points, replace=False)
         points = points[idx]
 
-    # --- EDIFICIO RETTANGOLARE IDEALIZZATO (con finestre) ---
+    rp = rect_params or {}
+
+    # --- EDIFICIO RETTANGOLARE IDEALIZZATO (con finestre 3D e tetto rientrato) ---
     if method == "building_rect":
-        rp = rect_params or {}
-        return extrude_rectangular_building(
+        parts = extrude_rectangular_building(
             points,
             floor_height=rp.get("floor_height", 3.0),
             window_w=rp.get("window_w", 1.2),
             window_h=rp.get("window_h", 1.5),
             window_spacing=rp.get("window_spacing", 3.5),
             add_windows=rp.get("add_windows", True),
+            roof_inset=rp.get("roof_inset", 0.1),
         )
 
-    # --- ESTRUSIONE EDIFICIO (footprint reale) ---
-    if method in ("building_convex", "building_concave"):
-        return extrude_building(
-            points, lod=lod, use_concave=(method == "building_concave")
+    # --- SQUARED CONCAVE HULL (profilo reale squadrato a 90° + multi-altezze) ---
+    elif method == "building_squared":
+        parts = extrude_building(
+            points, lod=lod, use_concave=True,
+            orthogonalize=True,
+            multi_height=rp.get("multi_height", True),
+            roof_inset=rp.get("roof_inset", 0.08),
+            add_windows=rp.get("add_windows", True),
+            window_params=rp,
+        )
+
+    # --- ESTRUSIONE EDIFICIO (footprint concave o convex, no snap) ---
+    elif method in ("building_convex", "building_concave"):
+        parts = extrude_building(
+            points, lod=lod,
+            use_concave=(method == "building_concave"),
+            orthogonalize=False,
+            multi_height=False,
+            roof_inset=rp.get("roof_inset", 0.0),
+            add_windows=False,
         )
 
     # --- RICOSTRUZIONE SUPERFICIE (organica) ---
-    cloud = pv.PolyData(points.astype(np.float32))
-    surf = reconstruct(cloud, lod, method)
-    try:
-        surf = surf.triangulate()
-    except Exception:
-        pass
-    if surf.n_cells > max_cells:
+    else:
+        cloud = pv.PolyData(points.astype(np.float32))
+        surf = reconstruct(cloud, lod, method)
         try:
-            ratio = 1.0 - (max_cells / surf.n_cells)
-            surf = surf.decimate(ratio).triangulate()
+            surf = surf.triangulate()
         except Exception:
             pass
+        if surf.n_cells > max_cells:
+            try:
+                ratio = 1.0 - (max_cells / surf.n_cells)
+                surf = surf.decimate(ratio).triangulate()
+            except Exception:
+                pass
 
-    verts = np.asarray(surf.points, dtype=np.float32)
-    if surf.n_cells > 0 and surf.faces.size > 0:
-        faces = surf.faces.reshape(-1, 4)[:, 1:4].astype(np.int32)
-    else:
-        faces = np.zeros((0, 3), dtype=np.int32)
-    return {"surface": (verts, faces)}
+        verts = np.asarray(surf.points, dtype=np.float32)
+        if surf.n_cells > 0 and surf.faces.size > 0:
+            faces = surf.faces.reshape(-1, 4)[:, 1:4].astype(np.int32)
+        else:
+            faces = np.zeros((0, 3), dtype=np.int32)
+        parts = {"surface": (verts, faces)}
+
+    # Decimazione finale: riduce il carico su Plotly (evita crash a molti triangoli)
+    if decimate_ratio and decimate_ratio > 0:
+        parts = _decimate_parts(parts, ratio=decimate_ratio)
+    return parts
 
 
-# Palette CAD architettonica (light theme come da riferimento)
+# Palette CAD architettonica (look edificio reale)
 _PART_COLORS = {
-    "walls":   "#C9CCD1",   # muri grigio chiaro
-    "roof":    "#6B5A3E",   # tetto marrone piatto
+    "walls":   "#D1D1D1",   # muri grigio chiaro
+    "roof":    "#5D4037",   # tetto marrone scuro
     "floor":   "#3D3D3D",   # pavimento scuro (raramente visibile)
-    "windows": "#7DA9D1",   # finestre azzurro vetro
+    "windows": "#7DA9D1",   # finestre vetro azzurro riflettente
     "surface": "#B8C4D6",   # superficie organica (fallback)
+}
+# Prefisso → colore (permette varianti "walls_1", "roof_2" per blocchi multipli)
+_PART_COLORS_PREFIXES = {
+    "walls": "#D1D1D1",
+    "roof":  "#5D4037",
+    "floor": "#3D3D3D",
+    "windows": "#7DA9D1",
 }
 
 
-def _mesh_trace(verts, faces, color, flatshading=True, show_edges=False):
-    """Mesh3d trace con lighting architettonico + opzionale wireframe."""
+def _color_for(name: str) -> str:
+    if name in _PART_COLORS:
+        return _PART_COLORS[name]
+    for pfx, col in _PART_COLORS_PREFIXES.items():
+        if name.startswith(pfx):
+            return col
+    return "#B8C4D6"
+
+
+def _silhouette_edges(verts: np.ndarray, faces: np.ndarray) -> list[tuple[int, int]]:
+    """
+    Estrae gli edge "di contorno": quelli condivisi da facce con normali
+    diverse (angolo > soglia). Evita di disegnare le diagonali interne
+    dei quad → look CAD pulito senza rumore.
+    """
+    if len(faces) == 0:
+        return []
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    n = np.cross(v1 - v0, v2 - v0)
+    nn = np.linalg.norm(n, axis=1, keepdims=True)
+    nrm = n / np.maximum(nn, 1e-9)
+
+    from collections import defaultdict
+    edge_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi, tri in enumerate(faces):
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            key = (int(tri[a]), int(tri[b])) if tri[a] < tri[b] else (int(tri[b]), int(tri[a]))
+            edge_faces[key].append(fi)
+
+    out: list[tuple[int, int]] = []
+    cos_thresh = np.cos(np.deg2rad(20))  # angolo minimo per considerare "spigolo"
+    for key, fs in edge_faces.items():
+        if len(fs) == 1:
+            out.append(key)
+        else:
+            dot = float(np.dot(nrm[fs[0]], nrm[fs[1]]))
+            if dot < cos_thresh:
+                out.append(key)
+    return out
+
+
+def _mesh_trace(verts, faces, color, flatshading=True, show_edges=False,
+                opacity: float = 1.0, edge_color: str = "#111111",
+                edge_width: float = 1.0):
+    """Mesh3d trace con lighting architettonico + wireframe dei soli spigoli."""
     traces = [go.Mesh3d(
         x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
         i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
         color=color,
         flatshading=flatshading,
+        opacity=opacity,
         lighting=dict(
             ambient=0.45, diffuse=0.85,
             specular=0.15, roughness=0.85, fresnel=0.05,
@@ -700,16 +1172,15 @@ def _mesh_trace(verts, faces, color, flatshading=True, show_edges=False):
         showscale=False,
     )]
     if show_edges and len(faces) > 0:
-        # Segmenti per ogni edge di ogni triangolo (con NaN come separatore)
+        edges = _silhouette_edges(verts, faces)
         xs, ys, zs = [], [], []
-        for tri in faces:
-            for a, b in ((0, 1), (1, 2), (2, 0)):
-                xs += [verts[tri[a], 0], verts[tri[b], 0], None]
-                ys += [verts[tri[a], 1], verts[tri[b], 1], None]
-                zs += [verts[tri[a], 2], verts[tri[b], 2], None]
+        for a, b in edges:
+            xs += [float(verts[a, 0]), float(verts[b, 0]), None]
+            ys += [float(verts[a, 1]), float(verts[b, 1]), None]
+            zs += [float(verts[a, 2]), float(verts[b, 2]), None]
         traces.append(go.Scatter3d(
             x=xs, y=ys, z=zs, mode="lines",
-            line=dict(color="#2B2B2B", width=2),
+            line=dict(color=edge_color, width=edge_width),
             hoverinfo="skip", showlegend=False,
         ))
     return traces
@@ -734,10 +1205,17 @@ def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
         if len(f) == 0:
             continue
         any_mesh = True
-        color = _PART_COLORS.get(name, "#B8C4D6")
+        color = _color_for(name)
         # Pavimento e finestre non mostrano gli edge (rumore visivo)
-        edges = show_edges and name not in ("floor", "windows")
-        for tr in _mesh_trace(v, f, color, flatshading=True, show_edges=edges):
+        is_floor = name.startswith("floor")
+        is_window = name.startswith("windows")
+        edges = show_edges and not is_floor and not is_window
+        edge_w = 1.0 if not name.startswith("roof") else 1.2
+        for tr in _mesh_trace(
+            v, f, color,
+            flatshading=True, show_edges=edges,
+            edge_color="#111111", edge_width=edge_w,
+        ):
             fig.add_trace(tr)
 
     # Fallback a scatter se la ricostruzione ha prodotto 0 facce
@@ -814,6 +1292,7 @@ with st.sidebar:
     lod = st.slider("Livello di Dettaglio", 1, 10, 5,
                     help="Più alto = superficie più fine (ma più lento).")
     _method_labels = {
+        "building_squared": "🏢 Squared Concave Hull (CAD architettonico)",
         "building_rect":    "🏠 Edificio Rettangolare + Finestre",
         "building_concave": "🏛️ Estrusione Edificio (concave)",
         "building_convex":  "🏛️ Estrusione Edificio (convex)",
@@ -826,37 +1305,62 @@ with st.sidebar:
         format_func=lambda x: _method_labels[x],
         index=0,
         help=(
-            "**Edificio Rettangolare + Finestre** → modello idealizzato con muri "
-            "dritti, tetto piatto e griglia di finestre (per incarto energia).\n"
-            "**Estrusione Edificio** → look CAD pulito con footprint reale.\n"
-            "**Reconstruct Surface** → superficie organica continua.\n"
-            "**Delaunay 2.5D** → superficie aderente ai punti, buona per terreni."
+            "**Squared Concave Hull** → perimetro reale con rientranze, "
+            "squadrato a 90° come un CAD architettonico, con rilevamento "
+            "automatico di piani sfalsati.\n"
+            "**Edificio Rettangolare** → MBR via PCA + finestre procedurali.\n"
+            "**Estrusione Edificio** → concave/convex hull senza snap-to-grid.\n"
+            "**Reconstruct Surface** / **Delaunay 2.5D** → superfici organiche."
         ),
     )
 
-    # Parametri specifici per edificio rettangolare (incarto energia)
+    # Parametri specifici per edifici (condivisi tra building_rect/squared)
     rect_params: dict = {}
-    if method == "building_rect":
+    if method in ("building_rect", "building_squared"):
         st.markdown("**🏠 Parametri edificio**")
         rect_params["floor_height"] = st.slider(
             "Altezza piano (m)", 2.2, 5.0, 3.0, 0.1,
-            help="Altezza di interpiano usata per posizionare le finestre.",
+            help="Altezza di interpiano per posizionare le finestre.",
         )
+        rect_params["roof_inset"] = st.slider(
+            "Rientro tetto (m)", 0.0, 0.5, 0.1, 0.02,
+            help="Offset interno del tetto rispetto al filo muro.",
+        )
+        if method == "building_squared":
+            rect_params["multi_height"] = st.checkbox(
+                "Rileva piani sfalsati (multi-altezze)", value=True,
+                help="Rileva gronde multiple e crea blocchi separati.",
+            )
         rect_params["add_windows"] = st.checkbox("Aggiungi finestre", value=True)
         if rect_params["add_windows"]:
             rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
             rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
             rect_params["window_spacing"] = st.slider(
                 "Passo orizzontale (m)", 2.0, 8.0, 3.5, 0.1,
-                help="Distanza tipica tra finestre: l'algoritmo le distribuisce uniformi.",
             )
+            rect_params["window_depth"] = st.slider(
+                "Spessore finestra (m)", 0.02, 0.25, 0.08, 0.01,
+                help="Sporgenza del box vetro dal muro.",
+            )
+
+    decimate_pct = st.slider(
+        "Decimazione mesh (%)", 0, 95, 90, 5,
+        help="Riduzione % triangoli via PyVista (evita crash Plotly).",
+    )
+    decimate_ratio = decimate_pct / 100.0
 
     theme = st.radio("Tema 3D", ["light", "dark"], horizontal=True,
                      format_func=lambda x: "Chiaro (CAD)" if x == "light" else "Scuro")
     show_edges = st.checkbox("Mostra spigoli (wireframe)", value=True)
-    shape_mode = st.radio("Forma selezione", ["rect", "circle"],
-                          format_func=lambda x: "Rettangolo" if x == "rect" else "Cerchio",
-                          horizontal=True)
+    shape_mode = st.radio(
+        "Forma selezione", ["rect", "rect_rotated", "circle"],
+        format_func=lambda x: {
+            "rect": "Rettangolo",
+            "rect_rotated": "Rettangolo ruotabile",
+            "circle": "Cerchio",
+        }[x],
+        horizontal=False,
+    )
     show_points = st.checkbox("Sovrapponi nuvola di punti", value=False)
 
     st.markdown("---")
@@ -966,6 +1470,9 @@ with left:
                 "y1": min(ys), "y2": max(ys),
             }
 
+    elif shape_mode == "rect_rotated":
+        st.caption("Regola centro, dimensioni e rotazione con gli slider a destra per allineare il rettangolo all'edificio.")
+        rotrect_placeholder = st.empty()
     else:  # cerchio con raggio modificabile via slider
         st.caption("Regola centro e raggio con gli slider nel pannello a destra.")
         # Placeholder, il plot viene ridisegnato dopo aver letto gli slider
@@ -986,13 +1493,38 @@ with right:
             fig = build_topdown_plotly(preview_src, dragmode="pan", circle=selection)
             circle_placeholder.plotly_chart(fig, use_container_width=True, key=f"circle_{file_id}")
 
+    elif shape_mode == "rect_rotated":
+        span_x, span_y = x_max - x_min, y_max - y_min
+        cx = st.slider("Centro X", x_min, x_max, float((x_min + x_max) / 2), key="rr_cx")
+        cy = st.slider("Centro Y", y_min, y_max, float((y_min + y_max) / 2), key="rr_cy")
+        w = st.slider("Larghezza", span_x / 100, span_x, span_x / 3, key="rr_w")
+        h = st.slider("Altezza",   span_y / 100, span_y, span_y / 3, key="rr_h")
+        angle_deg = st.slider("Rotazione (°)", -180.0, 180.0, 0.0, 1.0, key="rr_ang",
+                              help="Ruota il rettangolo per allinearlo all'edificio.")
+        selection = {
+            "type": "rect_rotated",
+            "cx": cx, "cy": cy, "w": w, "h": h, "angle_deg": angle_deg,
+        }
+        with left:
+            fig = build_topdown_plotly(preview_src, dragmode="pan", rect_rotated=selection)
+            rotrect_placeholder.plotly_chart(fig, use_container_width=True, key=f"rotrect_{file_id}")
+
     if selection:
-        if selection["type"] == "rect":
+        t = selection["type"]
+        if t == "rect":
             st.code(
                 f"Rettangolo\n"
                 f"X: [{selection['x1']:.2f}, {selection['x2']:.2f}]\n"
                 f"Y: [{selection['y1']:.2f}, {selection['y2']:.2f}]\n"
                 f"Area: {(selection['x2']-selection['x1'])*(selection['y2']-selection['y1']):.2f}"
+            )
+        elif t == "rect_rotated":
+            st.code(
+                f"Rettangolo ruotato\n"
+                f"Centro: ({selection['cx']:.2f}, {selection['cy']:.2f})\n"
+                f"W×H: {selection['w']:.2f} × {selection['h']:.2f}\n"
+                f"Angolo: {selection['angle_deg']:.1f}°\n"
+                f"Area: {selection['w']*selection['h']:.2f}"
             )
         else:
             st.code(
@@ -1040,6 +1572,7 @@ with right:
                 mesh_parts = reconstruct_mesh_arrays(
                     points=pts, lod=lod, method=method,
                     rect_params=rect_params,
+                    decimate_ratio=decimate_ratio,
                 )
                 # Diagnostica: mesh quasi degenere?
                 all_v = [v for v, _ in mesh_parts.values() if len(v) > 0]
