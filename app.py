@@ -287,31 +287,182 @@ def reconstruct(cloud: pv.PolyData, lod: int, method: str) -> pv.PolyData:
     return surf
 
 
+def _concave_hull_2d(xy: np.ndarray, alpha_factor: float = 3.0) -> np.ndarray:
+    """
+    Alpha-shape / concave hull 2D senza dipendenze esterne.
+    alpha_factor basso → contorno più aderente (L-shape); alto → convex hull.
+    Ritorna un array Nx2 di punti ordinati lungo il contorno.
+    """
+    from collections import Counter
+    from scipy.spatial import ConvexHull, Delaunay
+
+    if len(xy) < 4:
+        return xy
+    try:
+        tri = Delaunay(xy)
+    except Exception:
+        return xy[ConvexHull(xy).vertices]
+
+    simplices = tri.simplices
+    v0, v1, v2 = xy[simplices[:, 0]], xy[simplices[:, 1]], xy[simplices[:, 2]]
+    max_edge = np.maximum.reduce([
+        np.linalg.norm(v1 - v0, axis=1),
+        np.linalg.norm(v2 - v1, axis=1),
+        np.linalg.norm(v0 - v2, axis=1),
+    ])
+    threshold = np.median(max_edge) * alpha_factor
+    kept = simplices[max_edge <= threshold]
+    if len(kept) == 0:
+        return xy[ConvexHull(xy).vertices]
+
+    # Edge che appaiono in UN SOLO triangolo = bordo
+    edges = np.vstack([
+        np.sort(kept[:, [0, 1]], axis=1),
+        np.sort(kept[:, [1, 2]], axis=1),
+        np.sort(kept[:, [2, 0]], axis=1),
+    ])
+    counts = Counter(map(tuple, edges.tolist()))
+    boundary = [e for e, c in counts.items() if c == 1]
+    if not boundary:
+        return xy[ConvexHull(xy).vertices]
+
+    # Stitch edges → polygon
+    adj: dict[int, list[int]] = {}
+    for a, b in boundary:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    start = boundary[0][0]
+    loop = [start]
+    current, prev = start, None
+    safety = len(boundary) + 10
+    while safety > 0:
+        safety -= 1
+        neigh = [n for n in adj.get(current, []) if n != prev]
+        if not neigh:
+            break
+        nxt = neigh[0]
+        if nxt == start and len(loop) > 2:
+            break
+        if nxt in loop:
+            break
+        loop.append(nxt)
+        prev, current = current, nxt
+
+    if len(loop) < 3:
+        return xy[ConvexHull(xy).vertices]
+    return xy[loop]
+
+
+def extrude_building(points: np.ndarray, lod: int, use_concave: bool = True) -> dict:
+    """
+    Ricostruzione prismatica di un edificio:
+      - ground/roof stimati dai percentili Z
+      - footprint 2D dai punti della metà superiore (concave o convex hull)
+      - estrusione verticale
+    Ritorna dict con mesh separate: 'walls', 'roof', 'floor'.
+    """
+    if len(points) < 10:
+        return {}
+
+    z_sorted = np.sort(points[:, 2])
+    z_floor = float(z_sorted[int(0.02 * (len(z_sorted) - 1))])
+    z_roof = float(z_sorted[int(0.98 * (len(z_sorted) - 1))])
+    if z_roof - z_floor < 1e-6:
+        return {}
+
+    # Usa la parte alta per il footprint (esclude terreno/vegetazione bassa)
+    z_thresh = z_floor + (z_roof - z_floor) * 0.35
+    body = points[points[:, 2] > z_thresh]
+    if len(body) < 20:
+        body = points
+
+    xy = body[:, :2].astype(np.float32)
+    # Downsample hull per velocità
+    if len(xy) > 4000:
+        idx = np.random.default_rng(0).choice(len(xy), 4000, replace=False)
+        xy = xy[idx]
+
+    # LOD: 1..10 → alpha_factor 6..1.5 (alto = conservativo/convex, basso = aderente)
+    alpha_factor = max(1.5, 7.0 - 0.55 * lod)
+    if use_concave:
+        footprint = _concave_hull_2d(xy, alpha_factor=alpha_factor)
+    else:
+        from scipy.spatial import ConvexHull
+        footprint = xy[ConvexHull(xy).vertices]
+
+    n = len(footprint)
+    if n < 3:
+        return {}
+
+    # --- MESH MURI: un quad per ogni edge, vertici separati per flatshading netto
+    wall_v = np.zeros((4 * n, 3), dtype=np.float32)
+    wall_f = np.zeros((2 * n, 3), dtype=np.int32)
+    for i in range(n):
+        j = (i + 1) % n
+        base = 4 * i
+        wall_v[base + 0] = [footprint[i, 0], footprint[i, 1], z_floor]
+        wall_v[base + 1] = [footprint[j, 0], footprint[j, 1], z_floor]
+        wall_v[base + 2] = [footprint[j, 0], footprint[j, 1], z_roof]
+        wall_v[base + 3] = [footprint[i, 0], footprint[i, 1], z_roof]
+        wall_f[2 * i + 0] = [base, base + 1, base + 2]
+        wall_f[2 * i + 1] = [base, base + 2, base + 3]
+
+    # --- MESH TETTO: triangle-fan dal centroide
+    cx, cy = float(footprint[:, 0].mean()), float(footprint[:, 1].mean())
+    roof_v = np.zeros((n + 1, 3), dtype=np.float32)
+    roof_v[:n, :2] = footprint
+    roof_v[:n, 2] = z_roof
+    roof_v[n] = [cx, cy, z_roof]
+    roof_f = np.zeros((n, 3), dtype=np.int32)
+    for i in range(n):
+        roof_f[i] = [i, (i + 1) % n, n]
+
+    # --- MESH PAVIMENTO: triangle-fan invertito
+    floor_v = np.zeros((n + 1, 3), dtype=np.float32)
+    floor_v[:n, :2] = footprint
+    floor_v[:n, 2] = z_floor
+    floor_v[n] = [cx, cy, z_floor]
+    floor_f = np.zeros((n, 3), dtype=np.int32)
+    for i in range(n):
+        floor_f[i] = [(i + 1) % n, i, n]  # winding invertito
+
+    return {
+        "walls": (wall_v, wall_f),
+        "roof": (roof_v, roof_f),
+        "floor": (floor_v, floor_f),
+    }
+
+
 def reconstruct_mesh_arrays(
     points: np.ndarray,
     lod: int,
     method: str,
     max_points: int = 60_000,
     max_cells: int = 150_000,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> dict:
     """
-    Usa PyVista per la ricostruzione, ritorna solo (vertices, faces_triangles)
-    come array numpy. Nessun rendering → nessuna dipendenza da trame/vtk.js/xvfb.
+    Ritorna un dict {nome_parte: (verts, faces)}.
+    - 'building': parti separate (walls/roof/floor) per look CAD
+    - 'reconstruct_surface' / 'delaunay_2d': unica mesh 'surface'
     """
-    # Downsample input (protezione OOM)
     if len(points) > max_points:
         idx = np.random.default_rng(42).choice(len(points), max_points, replace=False)
         points = points[idx]
 
+    # --- ESTRUSIONE EDIFICIO ---
+    if method in ("building_convex", "building_concave"):
+        return extrude_building(
+            points, lod=lod, use_concave=(method == "building_concave")
+        )
+
+    # --- RICOSTRUZIONE SUPERFICIE (organica) ---
     cloud = pv.PolyData(points.astype(np.float32))
     surf = reconstruct(cloud, lod, method)
-    # Assicura triangoli puri (Plotly Mesh3d richiede facce triangolari)
     try:
         surf = surf.triangulate()
     except Exception:
         pass
-
-    # Decimation se troppo densa
     if surf.n_cells > max_cells:
         try:
             ratio = 1.0 - (max_cells / surf.n_cells)
@@ -321,75 +472,116 @@ def reconstruct_mesh_arrays(
 
     verts = np.asarray(surf.points, dtype=np.float32)
     if surf.n_cells > 0 and surf.faces.size > 0:
-        # surf.faces = [3, v0, v1, v2, 3, v3, v4, v5, ...]  (triangoli)
         faces = surf.faces.reshape(-1, 4)[:, 1:4].astype(np.int32)
     else:
         faces = np.zeros((0, 3), dtype=np.int32)
+    return {"surface": (verts, faces)}
 
-    return verts, faces
+
+# Palette CAD architettonica (light theme come da riferimento)
+_PART_COLORS = {
+    "walls":   "#C9CCD1",   # muri grigio chiaro
+    "roof":    "#8B6F47",   # tetto marrone
+    "floor":   "#3D3D3D",   # pavimento scuro (raramente visibile)
+    "surface": "#B8C4D6",   # superficie organica (fallback)
+}
 
 
-def build_3d_figure(
-    verts: np.ndarray,
-    faces: np.ndarray,
-    raw_points: np.ndarray | None = None,
-) -> go.Figure:
-    """Figura Plotly 3D con look CAD: mesh grigio-azzurra shadata + nuvola opzionale."""
+def _mesh_trace(verts, faces, color, flatshading=True, show_edges=False):
+    """Mesh3d trace con lighting architettonico + opzionale wireframe."""
+    traces = [go.Mesh3d(
+        x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+        color=color,
+        flatshading=flatshading,
+        lighting=dict(
+            ambient=0.45, diffuse=0.85,
+            specular=0.15, roughness=0.85, fresnel=0.05,
+        ),
+        lightposition=dict(x=10_000, y=10_000, z=20_000),
+        hoverinfo="skip",
+        showscale=False,
+    )]
+    if show_edges and len(faces) > 0:
+        # Segmenti per ogni edge di ogni triangolo (con NaN come separatore)
+        xs, ys, zs = [], [], []
+        for tri in faces:
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                xs += [verts[tri[a], 0], verts[tri[b], 0], None]
+                ys += [verts[tri[a], 1], verts[tri[b], 1], None]
+                zs += [verts[tri[a], 2], verts[tri[b], 2], None]
+        traces.append(go.Scatter3d(
+            x=xs, y=ys, z=zs, mode="lines",
+            line=dict(color="#2B2B2B", width=2),
+            hoverinfo="skip", showlegend=False,
+        ))
+    return traces
+
+
+def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
+                    theme: str = "light", show_edges: bool = True) -> go.Figure:
+    """
+    Costruisce figura Plotly 3D con mesh separate per parte (walls/roof/...).
+    theme: 'light' (stile CAD architettonico) o 'dark'.
+    """
     fig = go.Figure()
 
-    if len(faces) > 0:
-        fig.add_trace(go.Mesh3d(
-            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
-            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-            color="#B8C4D6",
-            flatshading=False,
-            lighting=dict(
-                ambient=0.30, diffuse=0.80,
-                specular=0.40, roughness=0.50, fresnel=0.20,
-            ),
-            lightposition=dict(x=1000, y=2000, z=3000),
-            hoverinfo="skip",
-            name="Superficie",
-        ))
+    if theme == "light":
+        bg, grid, text = "#F5F5F7", "#D0D0D4", "#1A1A1A"
     else:
-        # Nessuna mesh ricostruita → fallback a scatter 3D dei vertici
-        fig.add_trace(go.Scatter3d(
-            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
-            mode="markers",
-            marker=dict(size=2, color=verts[:, 2], colorscale="Viridis"),
-            name="Punti",
-        ))
+        bg, grid, text = "#0E1117", "#2A2F3A", "#FAFAFA"
 
+    # Mesh per ogni parte, con flatshading per spigoli netti
+    any_mesh = False
+    for name, (v, f) in mesh_dict.items():
+        if len(f) == 0:
+            continue
+        any_mesh = True
+        color = _PART_COLORS.get(name, "#B8C4D6")
+        # Pavimento non mostra gli edge (inutile)
+        edges = show_edges and name != "floor"
+        for tr in _mesh_trace(v, f, color, flatshading=True, show_edges=edges):
+            fig.add_trace(tr)
+
+    # Fallback a scatter se la ricostruzione ha prodotto 0 facce
+    if not any_mesh and mesh_dict:
+        v, _ = next(iter(mesh_dict.values()))
+        if len(v) > 0:
+            fig.add_trace(go.Scatter3d(
+                x=v[:, 0], y=v[:, 1], z=v[:, 2],
+                mode="markers",
+                marker=dict(size=2, color=v[:, 2], colorscale="Viridis"),
+                name="Punti", hoverinfo="skip",
+            ))
+
+    # Nuvola raw in sovraimpressione (opzionale)
     if raw_points is not None and len(raw_points) > 0:
-        # Sovrapponi nuvola (downsampled)
-        if len(raw_points) > 30_000:
-            idx = np.random.default_rng(0).choice(len(raw_points), 30_000, replace=False)
+        if len(raw_points) > 25_000:
+            idx = np.random.default_rng(0).choice(len(raw_points), 25_000, replace=False)
             raw_points = raw_points[idx]
         fig.add_trace(go.Scatter3d(
             x=raw_points[:, 0], y=raw_points[:, 1], z=raw_points[:, 2],
             mode="markers",
-            marker=dict(size=1.5, color="#00E5FF", opacity=0.55),
-            name="Nuvola",
-            hoverinfo="skip",
+            marker=dict(size=1.2, color="#0078D4", opacity=0.45),
+            name="Nuvola", hoverinfo="skip",
         ))
 
     axis = dict(
-        backgroundcolor="#0E1117",
-        gridcolor="#2A2F3A",
-        showbackground=True,
-        zerolinecolor="#3A4050",
-        color="#FAFAFA",
+        backgroundcolor=bg, gridcolor=grid,
+        showbackground=True, zerolinecolor=grid,
+        color=text, showspikes=False,
     )
     fig.update_layout(
         scene=dict(
             xaxis=axis, yaxis=axis, zaxis=axis,
             aspectmode="data",
-            camera=dict(eye=dict(x=1.6, y=1.6, z=1.1)),
+            camera=dict(eye=dict(x=1.4, y=1.4, z=0.9),
+                        up=dict(x=0, y=0, z=1)),
         ),
-        paper_bgcolor="#0E1117",
-        plot_bgcolor="#0E1117",
+        paper_bgcolor=bg, plot_bgcolor=bg,
+        font=dict(color=text),
         margin=dict(l=0, r=0, t=0, b=0),
-        height=650,
+        height=680,
         showlegend=False,
     )
     return fig
@@ -424,13 +616,26 @@ with st.sidebar:
     )
     lod = st.slider("Livello di Dettaglio", 1, 10, 5,
                     help="Più alto = superficie più fine (ma più lento).")
+    _method_labels = {
+        "building_concave": "🏛️ Estrusione Edificio (concave)",
+        "building_convex":  "🏛️ Estrusione Edificio (convex)",
+        "reconstruct_surface": "Reconstruct Surface (VTK)",
+        "delaunay_2d": "Delaunay 2.5D (superficie)",
+    }
     method = st.radio(
         "Metodo ricostruzione",
-        options=["reconstruct_surface", "delaunay_2d"],
-        format_func=lambda x: "Reconstruct Surface (VTK)" if x == "reconstruct_surface"
-                              else "Delaunay 2.5D (edifici)",
+        options=list(_method_labels.keys()),
+        format_func=lambda x: _method_labels[x],
         index=0,
+        help=(
+            "**Estrusione Edificio** → look CAD pulito (muri, tetto, pavimento separati).\n"
+            "**Reconstruct Surface** → superficie organica continua.\n"
+            "**Delaunay 2.5D** → superficie aderente ai punti, buona per terreni."
+        ),
     )
+    theme = st.radio("Tema 3D", ["light", "dark"], horizontal=True,
+                     format_func=lambda x: "Chiaro (CAD)" if x == "light" else "Scuro")
+    show_edges = st.checkbox("Mostra spigoli (wireframe)", value=True)
     shape_mode = st.radio("Forma selezione", ["rect", "circle"],
                           format_func=lambda x: "Rettangolo" if x == "rect" else "Cerchio",
                           horizontal=True)
@@ -614,12 +819,11 @@ with right:
         with st.spinner(f"Ricostruzione superficie su {len(source_df):,} punti..."):
             try:
                 pts = source_df[["X", "Y", "Z"]].to_numpy(dtype=np.float32)
-                verts, faces = reconstruct_mesh_arrays(
+                mesh_parts = reconstruct_mesh_arrays(
                     points=pts, lod=lod, method=method,
                 )
                 st.session_state.mesh_data = {
-                    "verts": verts,
-                    "faces": faces,
+                    "parts": mesh_parts,
                     "points": pts if show_points else None,
                 }
             except Exception as e:
@@ -634,12 +838,19 @@ st.subheader("🏛️ Modello 3D ricostruito")
 
 if st.session_state.mesh_data:
     md = st.session_state.mesh_data
-    fig_3d = build_3d_figure(md["verts"], md["faces"], raw_points=md.get("points"))
+    parts = md.get("parts", {})
+    fig_3d = build_3d_figure(
+        parts, raw_points=md.get("points"),
+        theme=theme, show_edges=show_edges,
+    )
     st.plotly_chart(fig_3d, use_container_width=True, theme=None)
 
-    c1, c2 = st.columns(2)
-    c1.metric("Vertici mesh", f"{len(md['verts']):,}")
-    c2.metric("Triangoli", f"{len(md['faces']):,}")
+    total_v = sum(len(v) for v, _ in parts.values())
+    total_f = sum(len(f) for _, f in parts.values())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Parti mesh", len(parts))
+    c2.metric("Vertici", f"{total_v:,}")
+    c3.metric("Triangoli", f"{total_f:,}")
 
     df_3d = st.session_state.cropped_df if st.session_state.cropped_df is not None else df_filtered
     with st.expander("🔎 Anteprima dati"):
