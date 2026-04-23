@@ -10,49 +10,12 @@ import os
 import tempfile
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import pyvista as pv
 import streamlit as st
 import streamlit.components.v1 as components
-from PIL import Image
-
-# --- Compat shim per streamlit-drawable-canvas su Streamlit >= 1.40 ---
-# Non basta rimpiazzare l'import: anche la *firma* di image_to_url è cambiata
-# (ora vuole un layout_config invece di un int width). Qui reimplementiamo
-# la vecchia API in modo autonomo, producendo un data-URL base64 dell'immagine.
-import base64
-from io import BytesIO as _BytesIO
-
-def _legacy_image_to_url(image, width=None, clamp=None, channels="RGB",
-                         output_format="PNG", image_id=None, **_kwargs):
-    """Shim compatibile con la vecchia API image_to_url."""
-    if isinstance(image, Image.Image):
-        pil = image
-    elif isinstance(image, np.ndarray):
-        pil = Image.fromarray(image)
-    elif isinstance(image, (bytes, bytearray)):
-        pil = Image.open(_BytesIO(image))
-    else:
-        pil = Image.open(image)
-    if channels and pil.mode != channels:
-        pil = pil.convert(channels)
-    buf = _BytesIO()
-    fmt = (output_format or "PNG").upper()
-    pil.save(buf, format=fmt)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/{fmt.lower()};base64,{b64}"
-
-try:
-    import streamlit.elements.image as _st_image  # type: ignore
-    # Installiamo sempre il shim: la firma originale non è più compatibile
-    # con drawable-canvas 0.9.x anche quando il simbolo è ancora esposto.
-    _st_image.image_to_url = _legacy_image_to_url
-except Exception:
-    pass
-
-from streamlit_drawable_canvas import st_canvas  # noqa: E402
 
 # CAD loaders opzionali
 try:
@@ -229,86 +192,46 @@ def load_dwg(file_bytes: bytes) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# VISTA PLANARE (PNG) — sfondo per il canvas di selezione
+# VISTA PLANARE (Plotly) — selezione nativa via box/lasso di Streamlit
 # ---------------------------------------------------------------------------
-def render_topdown_preview(df: pd.DataFrame, target_size: int = 600):
-    """
-    Rende una vista dall'alto (scatter XY) come PIL Image.
-    Ritorna (img, (x_min, x_max, y_min, y_max), (img_w, img_h)).
-    L'aspect ratio del plot riflette quello del mondo reale → mapping pixel↔mondo esatto.
-    """
-    x_min, x_max = float(df["X"].min()), float(df["X"].max())
-    y_min, y_max = float(df["Y"].min()), float(df["Y"].max())
-    dx, dy = x_max - x_min, y_max - y_min
-    if dx <= 0 or dy <= 0:
-        raise ValueError("Estensione XY nulla.")
-
-    # Dimensioni finali preservando aspect
-    if dx >= dy:
-        img_w = target_size
-        img_h = max(100, int(target_size * dy / dx))
-    else:
-        img_h = target_size
-        img_w = max(100, int(target_size * dx / dy))
-
-    fig = plt.figure(figsize=(img_w / 100, img_h / 100), dpi=100)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_facecolor("#0E1117")
-    ax.scatter(df["X"], df["Y"], s=0.4, c=df["Z"], cmap="viridis", linewidths=0)
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_aspect("equal")
-    ax.set_xticks([]); ax.set_yticks([])
-    for s in ax.spines.values():
-        s.set_visible(False)
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="PNG", facecolor="#0E1117")
-    plt.close(fig)
-    buf.seek(0)
-    img = Image.open(buf).convert("RGB").resize((img_w, img_h))
-    return img, (x_min, x_max, y_min, y_max), (img_w, img_h)
-
-
-# ---------------------------------------------------------------------------
-# MAPPING CANVAS → COORDINATE MONDO
-# ---------------------------------------------------------------------------
-def canvas_obj_to_world(obj: dict, bounds, img_dims) -> dict | None:
-    """
-    Converte un oggetto disegnato (rect o circle) da pixel canvas a coord mondo.
-    Canvas: origine top-left, Y verso il basso. Mondo: Y verso l'alto.
-    """
-    x_min, x_max, y_min, y_max = bounds
-    img_w, img_h = img_dims
-    sx = (x_max - x_min) / img_w
-    sy = (y_max - y_min) / img_h
-    t = obj.get("type")
-
-    if t == "rect":
-        left = obj["left"]; top = obj["top"]
-        w = obj["width"] * obj.get("scaleX", 1)
-        h = obj["height"] * obj.get("scaleY", 1)
-        x1 = x_min + left * sx
-        x2 = x_min + (left + w) * sx
-        # flip Y
-        y1 = y_max - top * sy
-        y2 = y_max - (top + h) * sy
-        return {
-            "type": "rect",
-            "x1": min(x1, x2), "x2": max(x1, x2),
-            "y1": min(y1, y2), "y2": max(y1, y2),
-        }
-
-    if t == "circle":
-        r_px = obj["radius"] * obj.get("scaleX", 1)
-        cx_px = obj["left"] + r_px
-        cy_px = obj["top"] + r_px
-        cx = x_min + cx_px * sx
-        cy = y_max - cy_px * sy
-        r = r_px * (sx + sy) / 2
-        return {"type": "circle", "cx": cx, "cy": cy, "r": r}
-
-    return None
+def build_topdown_plotly(df: pd.DataFrame, dragmode: str = "select",
+                         circle: dict | None = None) -> go.Figure:
+    """Scatter 2D (XY) con tool di selezione Plotly nativi."""
+    fig = go.Figure(
+        data=go.Scattergl(
+            x=df["X"], y=df["Y"],
+            mode="markers",
+            marker=dict(
+                size=3, color=df["Z"], colorscale="Viridis",
+                opacity=0.8, line=dict(width=0),
+            ),
+            hovertemplate="X: %{x:.2f}<br>Y: %{y:.2f}<br>Z: %{marker.color:.2f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        dragmode=dragmode,
+        paper_bgcolor="#0E1117",
+        plot_bgcolor="#0E1117",
+        font=dict(color="#FAFAFA"),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=600,
+        xaxis=dict(
+            scaleanchor="y", scaleratio=1,
+            gridcolor="#2A2F3A", zerolinecolor="#3A4050",
+        ),
+        yaxis=dict(gridcolor="#2A2F3A", zerolinecolor="#3A4050"),
+        showlegend=False,
+    )
+    # Overlay cerchio (modalità cerchio con slider)
+    if circle is not None:
+        cx, cy, r = circle["cx"], circle["cy"], circle["r"]
+        fig.add_shape(
+            type="circle",
+            x0=cx - r, x1=cx + r, y0=cy - r, y1=cy + r,
+            line=dict(color="#00E5FF", width=2),
+            fillcolor="rgba(0, 229, 255, 0.15)",
+        )
+    return fig
 
 
 def crop_by_selection(df: pd.DataFrame, sel: dict) -> pd.DataFrame:
@@ -537,38 +460,67 @@ st.markdown("---")
 # =========================================================================
 left, right = st.columns([3, 2])
 
+# Downsample per il rendering (WebGL regge bene 100k punti)
+preview_src = df_filtered
+if len(preview_src) > 100_000:
+    preview_src = df_filtered.sample(100_000, random_state=42)
+
+# Bound XY su dati filtrati (serve al cerchio)
+x_min, x_max = float(df_filtered["X"].min()), float(df_filtered["X"].max())
+y_min, y_max = float(df_filtered["Y"].min()), float(df_filtered["Y"].max())
+
+selection: dict | None = None
+
 with left:
-    st.subheader("📐 Vista planare — disegna l'area di interesse")
+    st.subheader("📐 Vista planare — seleziona l'area di interesse")
 
-    # Downsample per la preview (rendering matplotlib veloce)
-    preview_src = df_filtered
-    if len(preview_src) > 80_000:
-        preview_src = preview_src.sample(80_000, random_state=42)
+    if shape_mode == "rect":
+        st.caption("Usa lo strumento **Box Select** / **Lasso** nella toolbar in alto a destra.")
+        fig = build_topdown_plotly(preview_src, dragmode="select")
+        event = st.plotly_chart(
+            fig,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode=["box", "lasso"],
+            key=f"selector_{file_id}",
+        )
 
-    img, bounds, img_dims = render_topdown_preview(preview_src, target_size=600)
+        # Estrai bbox (rect) o poligono (lasso) dall'evento Streamlit
+        sel_data = event.get("selection", {}) if isinstance(event, dict) else {}
+        boxes = sel_data.get("box") or []
+        lassos = sel_data.get("lasso") or []
+        if boxes:
+            b = boxes[0]
+            xs = sorted(b["x"]); ys = sorted(b["y"])
+            selection = {"type": "rect", "x1": xs[0], "x2": xs[1], "y1": ys[0], "y2": ys[1]}
+        elif lassos:
+            l = lassos[0]
+            xs, ys = list(l["x"]), list(l["y"])
+            selection = {
+                "type": "rect",
+                "x1": min(xs), "x2": max(xs),
+                "y1": min(ys), "y2": max(ys),
+            }
 
-    canvas = st_canvas(
-        fill_color="rgba(0, 229, 255, 0.15)",
-        stroke_width=2,
-        stroke_color="#00E5FF",
-        background_color="#0E1117",
-        background_image=img,
-        update_streamlit=True,
-        width=img_dims[0],
-        height=img_dims[1],
-        drawing_mode=shape_mode,
-        key=f"canvas_{file_id}_{shape_mode}",
-    )
+    else:  # cerchio con raggio modificabile via slider
+        st.caption("Regola centro e raggio con gli slider nel pannello a destra.")
+        # Placeholder, il plot viene ridisegnato dopo aver letto gli slider
+        circle_placeholder = st.empty()
 
 with right:
     st.subheader("🎯 Selezione")
 
-    selection = None
-    if canvas.json_data is not None and canvas.json_data.get("objects"):
-        # Prendi l'ultima forma disegnata
-        last = canvas.json_data["objects"][-1]
-        selection = canvas_obj_to_world(last, bounds, img_dims)
-        st.session_state.last_selection = selection
+    if shape_mode == "circle":
+        cx = st.slider("Centro X", x_min, x_max, float((x_min + x_max) / 2))
+        cy = st.slider("Centro Y", y_min, y_max, float((y_min + y_max) / 2))
+        max_r = max(x_max - x_min, y_max - y_min) / 2
+        r = st.slider("Raggio", max_r / 100, max_r, max_r / 4)
+        selection = {"type": "circle", "cx": cx, "cy": cy, "r": r}
+
+        # Ridisegna il plot con il cerchio sovrapposto
+        with left:
+            fig = build_topdown_plotly(preview_src, dragmode="pan", circle=selection)
+            circle_placeholder.plotly_chart(fig, use_container_width=True, key=f"circle_{file_id}")
 
     if selection:
         if selection["type"] == "rect":
@@ -585,12 +537,8 @@ with right:
                 f"Raggio: {selection['r']:.2f}\n"
                 f"Area: {np.pi * selection['r']**2:.2f}"
             )
-
-        if selection["type"] == "circle":
-            scale = st.slider("Scala raggio", 0.1, 3.0, 1.0, 0.05)
-            selection = {**selection, "r": selection["r"] * scale}
     else:
-        st.info("Disegna un rettangolo o un cerchio sulla vista planare.")
+        st.info("Usa Box/Lasso sul grafico per selezionare un'area.")
 
     st.markdown("")
     confirm = st.button(
