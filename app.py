@@ -2453,6 +2453,37 @@ if _las_off:
         f"per riportarlo nel CRS originale somma gli offset in export."
     )
 
+# --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
+with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=False):
+    _bx = float(df_full["X"].max() - df_full["X"].min())
+    _by = float(df_full["Y"].max() - df_full["Y"].min())
+    _bz = float(df_full["Z"].max() - df_full["Z"].min())
+    _maxd = max(_bx, _by, _bz) or 1.0
+    _mind = min(_bx, _by, _bz)
+    _ratio = _mind / _maxd
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Extent X", f"{_bx:.2f} m")
+    d2.metric("Extent Y", f"{_by:.2f} m")
+    d3.metric("Extent Z", f"{_bz:.2f} m")
+    d4.metric("Ratio min/max", f"{_ratio:.4f}",
+              help="Se < 0.02 → nuvola quasi-planare (facciata singola, tetto, ecc.)")
+    if _ratio < 0.02:
+        # Quale asse è "schiacciato"?
+        _axes = {"X": _bx, "Y": _by, "Z": _bz}
+        _flat = min(_axes, key=_axes.get)
+        st.warning(
+            f"⚠️ Asse **{_flat}** quasi-piatto ({_axes[_flat]:.3f} m vs "
+            f"{_maxd:.1f} m sugli altri). Significa che la nuvola caricata è "
+            f"una **singola facciata / piano** (non un edificio completo dall'alto). "
+            f"Per estrudere un volume 3D servono punti distribuiti anche sul "
+            f"terzo asse."
+        )
+    st.caption(
+        f"Range grezzi: X [{df_full['X'].min():.2f}, {df_full['X'].max():.2f}] · "
+        f"Y [{df_full['Y'].min():.2f}, {df_full['Y'].max():.2f}] · "
+        f"Z [{df_full['Z'].min():.2f}, {df_full['Z'].max():.2f}]"
+    )
+
 # Filtro Z (frazione del range)
 z_min, z_max = float(df_full["Z"].min()), float(df_full["Z"].max())
 z_cut = z_min + z_threshold * (z_max - z_min)
