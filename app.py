@@ -2454,7 +2454,8 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=False):
+st.caption(f"🛠️ build 2026-04-24 · LAS support + bbox diagnostic")
+with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
     _bz = float(df_full["Z"].max() - df_full["Z"].min())
