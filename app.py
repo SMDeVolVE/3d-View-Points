@@ -1833,6 +1833,221 @@ def _windows_from_cloud(points: np.ndarray,
     )
 
 
+def extrude_facade_2d(
+    points: np.ndarray,
+    facade_thickness: float = 0.05,
+    window_detect: bool = True,
+    plane_band: float = 0.30,
+    cell: float = 0.10,
+    min_w: float = 0.4, max_w: float = 4.0,
+    min_h: float = 0.4, max_h: float = 3.0,
+    use_rgb: bool | None = None,
+) -> dict:
+    """
+    Ricostruzione 2.5D per nuvole intrinsecamente PLANARI (facciate singole,
+    sezioni, profili esportati da CAD).
+
+    Differisce dai metodi volumetrici: invece di estrudere un footprint
+    verticalmente, assume che la nuvola GIACCIA su un piano. Rileva il
+    piano principale (asse con estensione minima = normale), proietta i
+    punti nel sistema locale (u, v) e produce:
+
+      - `facciata`  : pannello rettangolare sottile sul piano della nuvola
+      - `finestre`  : rettangoli delle finestre rilevate (recessati nel muro)
+
+    Strategia detection finestre (riutilizza la logica di _windows_from_cloud
+    ma per UN solo piano):
+      1. seleziona punti entro ±plane_band dal piano mediano
+      2. rasterizza (u, v) a `cell` metri
+      3. classifica celle finestra: RGB (blu/scuro/sky) + voids
+         (densità < 30% mediana, lontano dai bordi)
+      4. morphology close→open + connected components
+      5. filtra per dimensioni plausibili e aspect ratio
+
+    Ritorna dict parti + `_facade_meta` + `_windows_meta` per UI/export.
+    """
+    pts_all = np.asarray(points, dtype=np.float64)
+    pts_xyz = pts_all[:, :3]
+    has_rgb = pts_all.ndim == 2 and pts_all.shape[1] >= 6
+    if use_rgb is None:
+        use_rgb = has_rgb
+
+    n = len(pts_xyz)
+    if n < 20:
+        return {"_facade_meta": {"status": "empty", "reason": "too few points"}}
+
+    mins = pts_xyz.min(0)
+    maxs = pts_xyz.max(0)
+    ext = maxs - mins
+    if ext.max() < 1e-6:
+        return {"_facade_meta": {"status": "empty", "reason": "zero extent"}}
+
+    # Asse "piatto" = normale al piano della facciata
+    flat_axis = int(np.argmin(ext))
+    # (u, v) sono i due assi non piatti. Convenzione: se la normale è
+    # orizzontale (X o Y), manteniamo v = Z (altezza reale). Se la normale
+    # è Z (piano orizzontale), u = X, v = Y.
+    if flat_axis == 2:
+        u_axis, v_axis = 0, 1
+    else:
+        u_axis = 1 if flat_axis == 0 else 0
+        v_axis = 2
+
+    u_all = pts_xyz[:, u_axis] - mins[u_axis]
+    v_all = pts_xyz[:, v_axis] - mins[v_axis]
+    w_all = pts_xyz[:, flat_axis]
+    w_center = float(np.median(w_all))
+
+    u_len = float(ext[u_axis])
+    v_len = float(ext[v_axis])
+
+    def uv_to_xyz(uv_arr: np.ndarray, w_off: float) -> np.ndarray:
+        """(u,v) locali → (x,y,z) mondo, a profondità w_center + w_off."""
+        m = len(uv_arr)
+        out = np.zeros((m, 3), dtype=np.float64)
+        out[:, u_axis] = uv_arr[:, 0] + mins[u_axis]
+        out[:, v_axis] = uv_arr[:, 1] + mins[v_axis]
+        out[:, flat_axis] = w_center + w_off
+        return out
+
+    # ---- PANNELLO FACCIATA: scatola sottile centrata sul piano ----
+    half = facade_thickness / 2.0
+    rect_uv = np.array([[0, 0], [u_len, 0], [u_len, v_len], [0, v_len]],
+                       dtype=np.float64)
+    front = uv_to_xyz(rect_uv, -half)
+    back = uv_to_xyz(rect_uv, +half)
+    V_fac = np.concatenate([front, back], axis=0)   # 8 vertici (0-3 fronte, 4-7 retro)
+    F_fac = np.array([
+        [0, 1, 2], [0, 2, 3],          # faccia frontale
+        [4, 6, 5], [4, 7, 6],          # faccia posteriore
+        [0, 4, 5], [0, 5, 1],          # bordo inferiore
+        [1, 5, 6], [1, 6, 2],          # bordo destro
+        [2, 6, 7], [2, 7, 3],          # bordo superiore
+        [3, 7, 4], [3, 4, 0],          # bordo sinistro
+    ], dtype=np.int32)
+
+    # ---- DETECTION FINESTRE sul piano ----
+    V_win_list: list[np.ndarray] = []
+    F_win_list: list[np.ndarray] = []
+    v_off = 0
+    meta: list[dict] = []
+
+    if window_detect and n >= 100:
+        band = np.abs(w_all - w_center) <= max(plane_band, ext[flat_axis] * 1.2)
+        if int(band.sum()) >= 100:
+            u_sel = u_all[band]
+            v_sel = v_all[band]
+            nu = max(10, int(u_len / cell))
+            nv = max(10, int(v_len / cell))
+            iu = np.clip((u_sel / cell).astype(int), 0, nu - 1)
+            iv = np.clip((v_sel / cell).astype(int), 0, nv - 1)
+
+            density = np.zeros((nv, nu), dtype=np.int32)
+            np.add.at(density, (iv, iu), 1)
+
+            # --- classificazione colore (RGB) ---
+            win_color = np.zeros((nv, nu), dtype=bool)
+            if use_rgb and has_rgb:
+                rgb_sel = pts_all[band, 3:6].astype(np.float32)
+                r_s = np.zeros((nv, nu), dtype=np.float32)
+                g_s = np.zeros((nv, nu), dtype=np.float32)
+                b_s = np.zeros((nv, nu), dtype=np.float32)
+                np.add.at(r_s, (iv, iu), rgb_sel[:, 0])
+                np.add.at(g_s, (iv, iu), rgb_sel[:, 1])
+                np.add.at(b_s, (iv, iu), rgb_sel[:, 2])
+                d_safe = np.maximum(density, 1)
+                r_m = r_s / d_safe; g_m = g_s / d_safe; b_m = b_s / d_safe
+                lum = 0.299 * r_m + 0.587 * g_m + 0.114 * b_m
+                is_blue = (b_m > r_m + 10) & (b_m > g_m) & (b_m > 60)
+                is_dark = lum < 55
+                is_skylike = (lum > 195) & (np.abs(r_m - g_m) < 20) & (np.abs(g_m - b_m) < 25)
+                win_color = (is_blue | is_dark | is_skylike) & (density > 0)
+
+            # --- voids: cella a bassa densità non ai bordi ---
+            win_void = np.zeros((nv, nu), dtype=bool)
+            occupied = density[density > 0]
+            if occupied.size > 5:
+                med_d = float(np.median(occupied))
+                low_d = (density > 0) & (density < med_d * 0.30)
+                border = np.zeros((nv, nu), dtype=bool)
+                if nv > 6 and nu > 6:
+                    border[3:-3, 3:-3] = True
+                win_void = low_d & border
+
+            win_mask = win_color | win_void
+            if win_mask.any():
+                try:
+                    from scipy.ndimage import binary_opening, binary_closing, label
+                    win_mask = binary_closing(win_mask, iterations=2)
+                    win_mask = binary_opening(win_mask, iterations=1)
+                    labeled, n_cc = label(win_mask)
+                except ImportError:
+                    labeled = win_mask.astype(np.int32)
+                    n_cc = 1
+
+                recess = 0.02   # 2 cm recesso del vetro dentro la facciata
+                depth = 0.04    # profondità 4 cm scatola finestra
+                for cc in range(1, n_cc + 1):
+                    ys, xs = np.where(labeled == cc)
+                    if len(xs) < 4:
+                        continue
+                    u_lo = float(xs.min()) * cell
+                    u_hi = float(xs.max() + 1) * cell
+                    v_lo = float(ys.min()) * cell
+                    v_hi = float(ys.max() + 1) * cell
+                    w = u_hi - u_lo
+                    h = v_hi - v_lo
+                    if w < min_w or h < min_h or w > max_w or h > max_h:
+                        continue
+                    if min(w, h) / max(w, h) < 0.10:
+                        continue
+
+                    win_uv = np.array([[u_lo, v_lo], [u_hi, v_lo],
+                                       [u_hi, v_hi], [u_lo, v_hi]],
+                                      dtype=np.float64)
+                    f_front = uv_to_xyz(win_uv, -half - recess)
+                    f_back = uv_to_xyz(win_uv, -half - recess - depth)
+                    V_win_list.append(np.concatenate([f_front, f_back], axis=0))
+                    F_win_list.append(np.array([
+                        [0, 1, 2], [0, 2, 3],
+                        [4, 6, 5], [4, 7, 6],
+                        [0, 4, 5], [0, 5, 1],
+                        [1, 5, 6], [1, 6, 2],
+                        [2, 6, 7], [2, 7, 3],
+                        [3, 7, 4], [3, 4, 0],
+                    ], dtype=np.int32) + v_off)
+                    v_off += 8
+                    meta.append({
+                        "u_lo": u_lo, "u_hi": u_hi,
+                        "v_lo": v_lo, "v_hi": v_hi,
+                        "width": float(w), "height": float(h),
+                        "area": float(w * h),
+                        "compass": "—",
+                    })
+
+    parts: dict = {
+        "facciata": (V_fac.astype(np.float32), F_fac.astype(np.int32)),
+    }
+    if V_win_list:
+        parts["finestre"] = (
+            np.concatenate(V_win_list, axis=0).astype(np.float32),
+            np.concatenate(F_win_list, axis=0).astype(np.int32),
+        )
+    parts["_facade_meta"] = {
+        "u_axis": ["X", "Y", "Z"][u_axis],
+        "v_axis": ["X", "Y", "Z"][v_axis],
+        "normal_axis": ["X", "Y", "Z"][flat_axis],
+        "u_size": u_len,
+        "v_size": v_len,
+        "real_thickness": float(ext[flat_axis]),
+        "n_windows": len(meta),
+        "total_window_area": float(sum(m["area"] for m in meta)),
+        "facade_area": float(u_len * v_len),
+    }
+    parts["_windows_meta"] = meta
+    return parts
+
+
 def reconstruct_mesh_arrays(
     points: np.ndarray,
     lod: int,
@@ -1888,6 +2103,20 @@ def reconstruct_mesh_arrays(
             window_params=rp,
             epsilon=rp.get("epsilon", 0.8),
             roof_top_frac=rp.get("roof_top_frac", 0.10),
+        )
+
+    # --- FACCIATA 2D (nuvole planari / sezioni) -------------------------------
+    elif method == "facade_2d":
+        parts = extrude_facade_2d(
+            points,
+            facade_thickness=rp.get("facade_thickness", 0.05),
+            window_detect=rp.get("facade_detect_windows", True),
+            plane_band=rp.get("facade_plane_band", 0.30),
+            cell=rp.get("facade_cell", 0.10),
+            min_w=rp.get("facade_min_w", 0.4),
+            max_w=rp.get("facade_max_w", 4.0),
+            min_h=rp.get("facade_min_h", 0.4),
+            max_h=rp.get("facade_max_h", 3.0),
         )
 
     # --- ESTRUSIONE EDIFICIO (footprint concave o convex, no snap) ---
@@ -2251,160 +2480,129 @@ st.caption("Carica `.xyz` / `.dxf` / `.dwg`, seleziona un'area e ottieni il mode
 with st.sidebar:
     st.header("⚙️ Controlli")
 
-    z_threshold = st.slider(
-        "Soglia altezza (Z)", 0.0, 1.0, 0.0, 0.01,
-        help="Frazione del range Z sotto cui i punti vengono esclusi (rimuove il terreno).",
-    )
-    lod = st.slider("Livello di Dettaglio", 1, 10, 5,
-                    help="Più alto = superficie più fine (ma più lento).")
+    # ── 3 scelte principali: tipo di dato → metodo ─────────────────────────
     _method_labels = {
-        "building_squared": "🏢 Squared Concave Hull (CAD architettonico)",
-        "building_rect":    "🏠 Edificio Rettangolare + Finestre",
-        "building_concave": "🏛️ Estrusione Edificio (concave)",
-        "building_convex":  "🏛️ Estrusione Edificio (convex)",
-        "reconstruct_surface": "Reconstruct Surface (VTK)",
-        "delaunay_2d": "Delaunay 2.5D (superficie)",
+        "building_squared": "🏠 Edificio (scansione dall'alto)",
+        "facade_2d":        "🪟 Facciata 2D (scansione di un muro)",
+        "delaunay_2d":      "🏞️ Superficie libera (terreno / organica)",
     }
     method = st.radio(
-        "Metodo ricostruzione",
+        "Cosa vuoi ricostruire?",
         options=list(_method_labels.keys()),
         format_func=lambda x: _method_labels[x],
         index=0,
-        help=(
-            "**Squared Concave Hull** → perimetro reale con rientranze, "
-            "squadrato a 90° come un CAD architettonico, con rilevamento "
-            "automatico di piani sfalsati.\n"
-            "**Edificio Rettangolare** → MBR via PCA + finestre procedurali.\n"
-            "**Estrusione Edificio** → concave/convex hull senza snap-to-grid.\n"
-            "**Reconstruct Surface** / **Delaunay 2.5D** → superfici organiche."
-        ),
     )
 
-    # Parametri specifici per edifici (condivisi tra building_rect/squared)
+    # ── Parametri essenziali (quelli che cambiano davvero il risultato) ───
     rect_params: dict = {}
-    if method in ("building_rect", "building_squared", "building_concave", "building_convex"):
-        st.markdown("**🏠 Parametri edificio**")
+    if method == "building_squared":
         rect_params["floor_height"] = st.slider(
             "Altezza piano (m)", 2.2, 5.0, 3.0, 0.1,
-            help="Altezza di interpiano per posizionare le finestre.",
+            help="Serve a distribuire le finestre in verticale.",
         )
-        rect_params["roof_inset"] = st.slider(
-            "Rientro tetto (m)", 0.0, 0.5, 0.08, 0.02,
-            help="Offset interno del tetto rispetto al filo muro.",
+        rect_params["add_windows"] = st.checkbox("Aggiungi finestre", value=True)
+        if rect_params["add_windows"]:
+            rect_params["windows_mode"] = "detected"   # default intelligente
+
+    # Facciata 2D e Superficie libera non richiedono parametri visibili.
+
+    # ── Opzioni avanzate (espanse solo se servono, collassate di default) ──
+    with st.expander("⚙️ Opzioni avanzate", expanded=False):
+
+        z_threshold = st.slider(
+            "Soglia altezza (Z)", 0.0, 1.0, 0.0, 0.01,
+            help="Esclude i punti sotto questa frazione del range Z (per togliere il terreno).",
         )
-        if method in ("building_squared", "building_concave", "building_convex"):
+        show_points = st.checkbox("Sovrapponi nuvola di punti", value=False)
+
+        # -- Avanzate specifiche per metodo --
+        if method == "building_squared":
+            st.markdown("**Edificio – dettagli geometrici**")
+            rect_params["roof_inset"] = st.slider(
+                "Rientro tetto (m)", 0.0, 0.5, 0.08, 0.02,
+            )
             rect_params["epsilon"] = st.slider(
-                "Semplificazione Sagoma (m)", 0.2, 3.0, 0.8, 0.1,
-                help=(
-                    "Tolleranza dell'algoritmo di semplificazione del perimetro.\n"
-                    "Più alta = meno vertici (rettangolare → 4 vertici, L-shape → 6)."
-                    "\nValori tipici: 0.4–1.2 m."
-                ),
+                "Semplificazione sagoma (m)", 0.2, 3.0, 0.8, 0.1,
+                help="Più alta = meno vertici (rettangolo → 4, L-shape → 6).",
             )
             rect_params["roof_top_frac"] = st.slider(
                 "Filtro tetto (% altezza)", 0.05, 1.00, 0.25, 0.05,
-                help=(
-                    "Usa solo i punti nel top-N% dell'altezza per stimare la sagoma."
-                    "\n• 0.10 → solo la linea di gronda (escludi vegetazione alta)."
-                    "\n• 0.25 → compromesso: sagoma pulita senza perdere rientranze."
-                    "\n• 1.00 → tutti i punti (se hai già ritagliato bene l'edificio)."
-                    "\nSe la pianta esce rettangolare ma vedi una C/L nella foto aerea,"
-                    " ALZA questo valore (0.5–1.0) e abbassa 'Semplificazione Sagoma'."
-                ),
+                help="Usa solo i punti nel top-N% per stimare la sagoma.",
             )
-        if method == "building_squared":
             rect_params["multi_height"] = st.checkbox(
-                "Rileva piani sfalsati (multi-altezze)", value=False,
-                help=(
-                    "SOLO per un edificio con TORRE/ATTICO su base più larga "
-                    "(volumi annidati). Non usarlo se hai due edifici affiancati: "
-                    "in quel caso ritaglia e genera un edificio alla volta."
-                ),
+                "Rileva piani sfalsati (torre/attico)", value=False,
             )
-        rect_params["add_windows"] = st.checkbox(
-            "Aggiungi finestre",
-            value=(method in ("building_rect", "building_squared")),
-            help="Distribuisce finestre sulle pareti esterne principali.",
-        )
-        if rect_params["add_windows"]:
-            _win_mode_labels = {
-                "detected":   "🔍 Rilevate dalla nuvola (posizioni reali)",
-                "procedural": "📐 Procedurali (griglia uniforme)",
-            }
-            rect_params["windows_mode"] = st.radio(
-                "Modalità finestre",
-                options=list(_win_mode_labels.keys()),
-                format_func=lambda x: _win_mode_labels[x],
-                index=0,
-                help=(
-                    "**Rilevate** → segmenta le finestre dai punti reali:\n"
-                    "  • se la nuvola ha RGB → classifica vetro per colore\n"
-                    "    (blu/scuro/riflesso cielo)\n"
-                    "  • sempre → detect voids (buchi nella nuvola dove il laser\n"
-                    "    attraversa il vetro)\n"
-                    "**Procedurali** → pattern uniforme dai parametri sotto "
-                    "(look CAD, posizioni INVENTATE)."
-                ),
-            )
-            if rect_params["windows_mode"] == "detected":
-                st.markdown("*Parametri detection dalla nuvola*")
-                rect_params["wall_thickness"] = st.slider(
-                    "Banda parete (m)", 0.10, 1.00, 0.35, 0.05,
-                    help="Distanza massima dal piano parete entro cui cercare punti.",
+            if rect_params.get("add_windows"):
+                _win_mode_labels = {
+                    "detected":   "🔍 Rilevate dalla nuvola (reali)",
+                    "procedural": "📐 Procedurali (griglia uniforme)",
+                }
+                rect_params["windows_mode"] = st.radio(
+                    "Modalità finestre",
+                    options=list(_win_mode_labels.keys()),
+                    format_func=lambda x: _win_mode_labels[x],
+                    index=0,
                 )
-                rect_params["detect_cell"] = st.slider(
+                if rect_params["windows_mode"] == "detected":
+                    rect_params["wall_thickness"] = st.slider(
+                        "Banda parete (m)", 0.10, 1.00, 0.35, 0.05,
+                    )
+                    rect_params["detect_cell"] = st.slider(
+                        "Risoluzione detection (m)", 0.05, 0.30, 0.10, 0.01,
+                    )
+                else:
+                    rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
+                    rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
+                    rect_params["window_spacing"] = st.slider("Passo orizzontale (m)", 2.0, 8.0, 3.5, 0.1)
+
+        elif method == "facade_2d":
+            st.markdown("**Facciata 2D – dettagli detection**")
+            rect_params["facade_thickness"] = st.slider(
+                "Spessore pannello (m)", 0.02, 0.50, 0.05, 0.01,
+            )
+            rect_params["facade_detect_windows"] = st.checkbox(
+                "Rileva finestre sul piano", value=True,
+            )
+            if rect_params["facade_detect_windows"]:
+                rect_params["facade_plane_band"] = st.slider(
+                    "Banda piano (m)", 0.05, 1.00, 0.30, 0.05,
+                )
+                rect_params["facade_cell"] = st.slider(
                     "Risoluzione detection (m)", 0.05, 0.30, 0.10, 0.01,
-                    help="Lato cella raster su parete. 10 cm = compromesso standard.",
                 )
-                c_w1, c_w2 = st.columns(2)
-                rect_params["window_min_w"] = c_w1.slider("Min L (m)", 0.3, 1.5, 0.4, 0.1)
-                rect_params["window_max_w"] = c_w2.slider("Max L (m)", 1.5, 6.0, 4.0, 0.1)
-                c_h1, c_h2 = st.columns(2)
-                rect_params["window_min_h"] = c_h1.slider("Min H (m)", 0.3, 1.5, 0.4, 0.1)
-                rect_params["window_max_h"] = c_h2.slider("Max H (m)", 1.5, 5.0, 3.0, 0.1)
-            else:
-                rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
-                rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
-                rect_params["window_spacing"] = st.slider(
-                    "Passo orizzontale (m)", 2.0, 8.0, 3.5, 0.1,
-                )
-            rect_params["window_depth"] = st.slider(
-                "Spessore finestra (m)", 0.02, 0.25, 0.08, 0.01,
-                help="Sporgenza del box vetro dal muro.",
-            )
 
-    decimate_pct = st.slider(
-        "Decimazione mesh (%)", 0, 95, 90, 5,
-        help="Riduzione % triangoli via PyVista (evita crash Plotly).",
-    )
+        # -- Rendering (raramente si cambiano) --
+        st.markdown("**Rendering**")
+        lod = st.slider("Livello di dettaglio mesh", 1, 10, 5)
+        decimate_pct = st.slider("Decimazione mesh (%)", 0, 95, 90, 5)
+        theme = st.radio("Tema 3D", ["light", "dark"], horizontal=True,
+                         format_func=lambda x: "Chiaro (CAD)" if x == "light" else "Scuro",
+                         index=1)
+        show_edges = st.checkbox("Mostra spigoli (wireframe)", value=True)
+
+        # -- Selezione --
+        shape_mode = st.radio(
+            "Forma selezione", ["rect", "rect_rotated", "circle"],
+            format_func=lambda x: {
+                "rect": "Rettangolo",
+                "rect_rotated": "Rettangolo ruotabile",
+                "circle": "Cerchio",
+            }[x],
+            horizontal=True,
+        )
+
+        # -- Formati --
+        st.markdown("**Formati supportati**")
+        st.caption(
+            "`.xyz` / `.txt` / `.csv` · `.las` / `.laz` (LiDAR, RGB opz.) · "
+            "`.dxf` · `.dwg` (richiede ODA File Converter)"
+        )
+        if not EZDXF_AVAILABLE:
+            st.warning("`ezdxf` non installato: DXF/DWG disabilitati.")
+        if not LASPY_AVAILABLE:
+            st.warning("`laspy` non installato: LAS/LAZ disabilitati.")
+
     decimate_ratio = decimate_pct / 100.0
-
-    theme = st.radio("Tema 3D", ["light", "dark"], horizontal=True,
-                     format_func=lambda x: "Chiaro (CAD)" if x == "light" else "Scuro")
-    show_edges = st.checkbox("Mostra spigoli (wireframe)", value=True)
-    shape_mode = st.radio(
-        "Forma selezione", ["rect", "rect_rotated", "circle"],
-        format_func=lambda x: {
-            "rect": "Rettangolo",
-            "rect_rotated": "Rettangolo ruotabile",
-            "circle": "Cerchio",
-        }[x],
-        horizontal=False,
-    )
-    show_points = st.checkbox("Sovrapponi nuvola di punti", value=False)
-
-    st.markdown("---")
-    st.markdown(
-        "**Formati supportati**\n\n"
-        "- `.xyz` / `.txt` / `.csv`\n"
-        "- `.las` / `.laz` — LiDAR (RGB se presente)\n"
-        "- `.dxf` — POINT/LINE/3DFACE/INSERT\n"
-        "- `.dwg` — richiede ODA File Converter"
-    )
-    if not EZDXF_AVAILABLE:
-        st.warning("`ezdxf` non installato: DXF/DWG disabilitati.")
-    if not LASPY_AVAILABLE:
-        st.warning("`laspy` non installato: LAS/LAZ disabilitati.")
 
 # Upload
 _accepted = ["xyz", "txt", "csv", "dxf", "dwg"]
@@ -2454,7 +2652,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-24 · LAS support + bbox diagnostic")
+st.caption(f"🛠️ build 2026-04-24b · facade 2D + simplified UI")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
@@ -2667,11 +2865,17 @@ with right:
                     stacked = np.concatenate(all_v, axis=0)
                     extent = stacked.max(axis=0) - stacked.min(axis=0)
                     if extent.max() > 0 and extent.min() < 0.02 * extent.max():
-                        st.warning(
-                            "⚠️ Geometria molto sottile: la nuvola è anisotropa. "
-                            "Prova il metodo **🏠 Edificio Rettangolare + Finestre** "
-                            "per ottenere un volume coerente."
-                        )
+                        if method == "facade_2d":
+                            # Atteso: il metodo 2D produce una mesh "piatta"
+                            pass
+                        else:
+                            st.warning(
+                                "⚠️ Geometria molto sottile: la nuvola è "
+                                "intrinsecamente planare. Per questo tipo di dati "
+                                "usa il metodo **🪟 Facciata 2D (scansione di un muro)** "
+                                "— rileva il piano e le finestre sul piano, "
+                                "senza tentare un'estrusione volumetrica."
+                            )
                 st.session_state.mesh_data = {
                     "parts": mesh_parts,
                     "points": pts[:, :3] if show_points else None,
@@ -2703,32 +2907,71 @@ if st.session_state.mesh_data:
     c2.metric("Vertici", f"{total_v:,}")
     c3.metric("Triangoli", f"{total_f:,}")
 
+    # ─── Facciata 2D: info piano rilevato ──────────────────────────────────
+    fac_meta = parts.get("_facade_meta")
+    if fac_meta and fac_meta.get("u_size"):
+        st.info(
+            f"🪟 **Facciata 2D rilevata** · piano **{fac_meta['u_axis']}-"
+            f"{fac_meta['v_axis']}** (normale = asse **{fac_meta['normal_axis']}**) · "
+            f"dimensioni **{fac_meta['u_size']:.2f} × {fac_meta['v_size']:.2f} m** "
+            f"({fac_meta['facade_area']:.1f} m²) · spessore reale nuvola "
+            f"{fac_meta['real_thickness']*100:.1f} cm"
+        )
+
     # ─── Stato modalità finestre + statistiche se detected ──────────────────
     win_meta = parts.get("_windows_meta")
-    if win_meta is not None:
+    if win_meta is not None and len(win_meta) > 0:
         st.success(
             f"🔍 **Finestre rilevate dalla nuvola**: {len(win_meta)} aperture identificate."
         )
-        by_compass: dict[str, list[dict]] = {}
-        for w in win_meta:
-            by_compass.setdefault(w["compass"], []).append(w)
-        if by_compass:
-            rows = []
-            for d in ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]:
-                ws = by_compass.get(d, [])
-                if not ws:
-                    continue
-                tot_area = sum(w["area"] for w in ws)
-                rows.append({
-                    "Orientamento": d,
-                    "N° finestre": len(ws),
-                    "Area totale (m²)": round(tot_area, 2),
-                    "Larghezza media (m)": round(sum(w["width"] for w in ws) / len(ws), 2),
-                    "Altezza media (m)": round(sum(w["height"] for w in ws) / len(ws), 2),
-                })
-            if rows:
-                st.markdown("**Ripartizione finestre per orientamento**")
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        # Modalità facciata 2D: nessun compass, mostra tabella semplice dimensioni
+        if fac_meta and all(w.get("compass", "—") == "—" for w in win_meta):
+            tot_area = sum(w["area"] for w in win_meta)
+            tot_fac = fac_meta.get("facade_area", 0) or 1.0
+            st.caption(
+                f"Superficie vetrata totale: **{tot_area:.2f} m²** "
+                f"({tot_area/tot_fac*100:.1f}% della facciata)"
+            )
+            rows_f = [
+                {
+                    "N°": i + 1,
+                    "Larghezza (m)": round(w["width"], 2),
+                    "Altezza (m)": round(w["height"], 2),
+                    "Area (m²)": round(w["area"], 2),
+                    "u (m)": round((w["u_lo"] + w["u_hi"]) / 2, 2),
+                    "v (m)": round((w["v_lo"] + w["v_hi"]) / 2, 2),
+                }
+                for i, w in enumerate(win_meta)
+            ]
+            st.markdown("**Finestre rilevate sul piano**")
+            st.dataframe(pd.DataFrame(rows_f), use_container_width=True, hide_index=True)
+        else:
+            by_compass: dict[str, list[dict]] = {}
+            for w in win_meta:
+                by_compass.setdefault(w["compass"], []).append(w)
+            if by_compass:
+                rows = []
+                for d in ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]:
+                    ws = by_compass.get(d, [])
+                    if not ws:
+                        continue
+                    tot_area = sum(w["area"] for w in ws)
+                    rows.append({
+                        "Orientamento": d,
+                        "N° finestre": len(ws),
+                        "Area totale (m²)": round(tot_area, 2),
+                        "Larghezza media (m)": round(sum(w["width"] for w in ws) / len(ws), 2),
+                        "Altezza media (m)": round(sum(w["height"] for w in ws) / len(ws), 2),
+                    })
+                if rows:
+                    st.markdown("**Ripartizione finestre per orientamento**")
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    elif win_meta is not None and len(win_meta) == 0 and method == "facade_2d":
+        st.warning(
+            "🔍 Nessuna finestra rilevata sul piano. Prova ad abbassare **Min L/Min H**, "
+            "aumentare **Banda piano**, o verifica che la nuvola abbia sufficienti "
+            "variazioni di densità/colore (voids = aree senza punti dove c'è il vetro)."
+        )
     elif rect_params.get("windows_mode") == "procedural" and rect_params.get("add_windows"):
         st.warning(
             "⚠️ **Finestre procedurali**: pattern uniforme non derivato dal dato reale. "
