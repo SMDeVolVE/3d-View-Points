@@ -151,7 +151,26 @@ def load_las(file_bytes: bytes, suffix: str = ".las") -> pd.DataFrame:
     xs = np.asarray(las.x, dtype=np.float64)
     ys = np.asarray(las.y, dtype=np.float64)
     zs = np.asarray(las.z, dtype=np.float64)
+
+    # --- RICENTRATURA per coordinate georeferenziate (CRUCIALE) ---------------
+    # I LAS aerei/topografici usano spesso UTM / CH1903+ con X,Y ~1e6-1e7.
+    # In float32 (usato a valle) la risoluzione a 2.7e6 è ~0.25 m: punti
+    # distanti 10 cm collassano sullo stesso valore → la nuvola diventa
+    # un piano ("geometria anisotropa") e la ricostruzione fallisce.
+    # Sottraiamo un offset intero per ogni asse che lo richiede: le
+    # coordinate restano fisicamente in metri, solo traslate vicino a 0.
+    offsets = {}
+    PRECISION_THRESHOLD = 1e5  # sopra questo valore float32 perde cm
+    for name, arr in (("X", xs), ("Y", ys), ("Z", zs)):
+        if arr.size and np.nanmax(np.abs(arr)) > PRECISION_THRESHOLD:
+            off = float(np.floor(np.nanmin(arr)))
+            arr -= off
+            offsets[name] = off
+
     df = pd.DataFrame({"X": xs, "Y": ys, "Z": zs})
+    # Esponi gli offset applicati per uso/diagnostica a valle
+    df.attrs["las_offsets"] = offsets
+    df.attrs["las_crs"] = getattr(las.header, "parse_crs", lambda: None)()
 
     # RGB è presente nei Point Format 2, 3, 5, 7, 8, 10 (LAS 1.2+)
     has_rgb = all(hasattr(las, c) for c in ("red", "green", "blue"))
@@ -2419,6 +2438,16 @@ try:
 except Exception as e:
     st.error(f"Errore nel parsing: {e}")
     st.stop()
+
+# Info ricentramento LAS (se applicato, per preservare precisione float32)
+_las_off = df_full.attrs.get("las_offsets", {}) if hasattr(df_full, "attrs") else {}
+if _las_off:
+    _fmt = ", ".join(f"{k} −{v:,.0f}".replace(",", "'") for k, v in _las_off.items())
+    st.info(
+        f"🛰️ File LAS georeferenziato: coordinate traslate per preservare "
+        f"precisione ({_fmt} m). Il modello resta in scala reale; "
+        f"per riportarlo nel CRS originale somma gli offset in export."
+    )
 
 # Filtro Z (frazione del range)
 z_min, z_max = float(df_full["Z"].min()), float(df_full["Z"].max())
