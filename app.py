@@ -1893,6 +1893,25 @@ def extrude_facade_2d(
         u_axis = 1 if flat_axis == 0 else 0
         v_axis = 2
 
+    # ---- Validazione: la nuvola è davvero un PIANO, non una LINEA? ----
+    # Se il secondo asse più piccolo è anch'esso < 10 cm, la nuvola è
+    # unidimensionale (profilo, traccia, sezione estratta troppo stretta)
+    # e non può rappresentare una facciata.
+    sorted_ext = np.sort(ext)      # [min, mid, max]
+    MIN_PLANE_WIDTH = 0.10         # 10 cm minimo su entrambi gli assi del piano
+    if sorted_ext[1] < MIN_PLANE_WIDTH:
+        return {"_facade_meta": {
+            "status": "not_a_plane",
+            "reason": (
+                f"La nuvola è lineare (1D): due assi su tre sono < {MIN_PLANE_WIDTH*100:.0f} cm "
+                f"(extent X={ext[0]:.3f}, Y={ext[1]:.3f}, Z={ext[2]:.3f} m). "
+                "Servono punti distribuiti su un piano (larghezza E altezza), "
+                "non lungo una singola retta."
+            ),
+            "extent_x": float(ext[0]), "extent_y": float(ext[1]),
+            "extent_z": float(ext[2]),
+        }}
+
     u_all = pts_xyz[:, u_axis] - mins[u_axis]
     v_all = pts_xyz[:, v_axis] - mins[v_axis]
     w_all = pts_xyz[:, flat_axis]
@@ -2909,7 +2928,19 @@ if st.session_state.mesh_data:
 
     # ─── Facciata 2D: info piano rilevato ──────────────────────────────────
     fac_meta = parts.get("_facade_meta")
-    if fac_meta and fac_meta.get("u_size"):
+    if fac_meta and fac_meta.get("status") == "not_a_plane":
+        st.error(
+            f"❌ **Impossibile ricostruire: la nuvola non è un piano, è una linea.**\n\n"
+            f"{fac_meta['reason']}\n\n"
+            "**Cause tipiche**:\n"
+            "• File esportato come *profilo / sezione / traccia* invece della nuvola completa\n"
+            "• Selezione troppo stretta sulla vista top-down\n"
+            "• File originato da un trasduttore 1D (livella laser, profilometro)\n\n"
+            "**Cosa fare**: ricarica il LAS originale (non sezionato) oppure carica un altro file. "
+            "Per modellare un edificio serve una nuvola 3D (drone aereo) o una facciata scansionata "
+            "a terra con spessore di almeno 10 cm."
+        )
+    elif fac_meta and fac_meta.get("u_size"):
         st.info(
             f"🪟 **Facciata 2D rilevata** · piano **{fac_meta['u_axis']}-"
             f"{fac_meta['v_axis']}** (normale = asse **{fac_meta['normal_axis']}**) · "
