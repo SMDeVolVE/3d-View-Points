@@ -24,6 +24,13 @@ try:
 except ImportError:
     EZDXF_AVAILABLE = False
 
+# LAS/LAZ loader opzionale
+try:
+    import laspy
+    LASPY_AVAILABLE = True
+except ImportError:
+    LASPY_AVAILABLE = False
+
 # PyVista lo usiamo solo per la ricostruzione geometrica (reconstruct_surface,
 # delaunay_2d). Il rendering lo fa Plotly: niente trame, niente subprocess,
 # niente export_html → niente crash su Streamlit Cloud.
@@ -102,6 +109,68 @@ def load_xyz(file_bytes: bytes) -> pd.DataFrame:
 
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna().reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# PARSER .LAS / .LAZ
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_las(file_bytes: bytes, suffix: str = ".las") -> pd.DataFrame:
+    """Parser per file LAS/LAZ (LiDAR). Estrae XYZ e RGB se presenti.
+
+    I file .laz (compressi) richiedono il backend `laszip` o `lazrs`
+    installato insieme a laspy: `pip install laspy[lazrs]`.
+    """
+    if not LASPY_AVAILABLE:
+        raise RuntimeError("laspy non installato: pip install laspy[lazrs]")
+
+    # laspy legge da path o da stream: usiamo un tempfile per compatibilità
+    # massima con .laz che richiede backend nativo.
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        path = tmp.name
+    try:
+        try:
+            las = laspy.read(path)
+        except laspy.errors.LaspyException as e:
+            # Tipico: file .laz senza backend di decompressione
+            if suffix.lower() == ".laz":
+                raise RuntimeError(
+                    "File .laz: manca il backend di decompressione. "
+                    "Installa con `pip install laspy[lazrs]` "
+                    "oppure `pip install laspy[laszip]`.\n"
+                    f"Dettaglio: {e}"
+                ) from e
+            raise
+    finally:
+        try: os.unlink(path)
+        except OSError: pass
+
+    # Coordinate scalate (laspy applica automaticamente scale/offset)
+    xs = np.asarray(las.x, dtype=np.float64)
+    ys = np.asarray(las.y, dtype=np.float64)
+    zs = np.asarray(las.z, dtype=np.float64)
+    df = pd.DataFrame({"X": xs, "Y": ys, "Z": zs})
+
+    # RGB è presente nei Point Format 2, 3, 5, 7, 8, 10 (LAS 1.2+)
+    has_rgb = all(hasattr(las, c) for c in ("red", "green", "blue"))
+    if has_rgb:
+        r = np.asarray(las.red, dtype=np.int64)
+        g = np.asarray(las.green, dtype=np.int64)
+        b = np.asarray(las.blue, dtype=np.int64)
+        # Nei LAS l'RGB è spesso a 16 bit (0–65535): riportalo a 8 bit se serve
+        maxv = int(max(r.max() if r.size else 0,
+                       g.max() if g.size else 0,
+                       b.max() if b.size else 0))
+        if maxv > 255:
+            r = (r >> 8).astype(np.int64)
+            g = (g >> 8).astype(np.int64)
+            b = (b >> 8).astype(np.int64)
+        df["R"] = np.clip(r, 0, 255).astype(int)
+        df["G"] = np.clip(g, 0, 255).astype(int)
+        df["B"] = np.clip(b, 0, 255).astype(int)
+
     return df.dropna().reset_index(drop=True)
 
 
@@ -973,7 +1042,12 @@ def _decimate_parts(parts: dict, ratio: float = 0.9, min_faces: int = 500) -> di
     if ratio <= 0:
         return parts
     out = {}
-    for name, (v, f) in parts.items():
+    for name, value in parts.items():
+        # Chiavi meta (es. "_windows_meta": list[dict]) pass-through
+        if name.startswith("_"):
+            out[name] = value
+            continue
+        v, f = value
         if len(f) < min_faces:
             out[name] = (v, f)
             continue
@@ -1035,6 +1109,8 @@ def extrude_rectangular_building(
     window_margin_top: float = 0.6,
     add_windows: bool = True,
     roof_inset: float = 0.1,
+    windows_mode: str = "procedural",
+    window_params: dict | None = None,
 ) -> dict:
     """
     Ricostruzione rettangolare (Minimum Bounding Rectangle via PCA):
@@ -1154,43 +1230,63 @@ def extrude_rectangular_building(
         "floor": (floor_v, floor_f),
     }
 
-    # --- FINESTRE: box 3D sottili sulle 4 pareti ---
+    # --- FINESTRE ---
     if add_windows:
-        all_v: list[np.ndarray] = []
-        all_f: list[np.ndarray] = []
-        v_offset = 0
-        depth = 0.08  # spessore davanzale (m)
-
-        for (p0, p1, wdir, nrm, wlen) in wall_meta:
-            available = wlen - 2 * window_margin_side
-            if available < window_w:
-                continue
-            n_win = max(1, int(available / window_spacing))
-            step = available / n_win
-
-            for floor_idx in range(n_floors):
-                f_z = z_floor + floor_idx * actual_floor_h
-                win_z_b = f_z + (actual_floor_h - window_h) / 2
-                win_z_t = win_z_b + window_h
-                if win_z_t > z_roof - window_margin_top:
-                    continue
-
-                for wi in range(n_win):
-                    t_along = window_margin_side + step * (wi + 0.5)
-                    c_xy = p0[:2].astype(np.float64) + wdir.astype(np.float64) * t_along
-                    v, f = _window_box(
-                        c_xy, wdir.astype(np.float64), nrm.astype(np.float64),
-                        win_z_b, win_z_t, width=window_w, depth=depth,
-                    )
-                    all_v.append(v)
-                    all_f.append(f + v_offset)
-                    v_offset += len(v)
-
-        if all_v:
-            result["windows"] = (
-                np.concatenate(all_v, axis=0).astype(np.float32),
-                np.concatenate(all_f, axis=0).astype(np.int32),
+        if windows_mode == "detected":
+            # Detection REALE dalla nuvola (RGB o voids)
+            fp_xy = corners[:, :2].astype(np.float32)
+            wp = window_params or {}
+            win_v, win_f, win_meta = _windows_from_cloud(
+                points, fp_xy, z_floor, z_roof,
+                wall_thickness=wp.get("wall_thickness", 0.35),
+                cell=wp.get("detect_cell", 0.10),
+                min_w=wp.get("window_min_w", 0.4),
+                max_w=wp.get("window_max_w", 4.0),
+                min_h=wp.get("window_min_h", 0.4),
+                max_h=wp.get("window_max_h", 3.0),
+                min_wall_frac=wp.get("min_wall_frac", 0.25),
+                depth=0.08,
             )
+            if len(win_v) > 0:
+                result["windows"] = (win_v, win_f)
+                result["_windows_meta"] = win_meta
+        else:
+            # Procedurale: griglia regolare sulle 4 pareti
+            all_v: list[np.ndarray] = []
+            all_f: list[np.ndarray] = []
+            v_offset = 0
+            depth = 0.08
+
+            for (p0, p1, wdir, nrm, wlen) in wall_meta:
+                available = wlen - 2 * window_margin_side
+                if available < window_w:
+                    continue
+                n_win = max(1, int(available / window_spacing))
+                step = available / n_win
+
+                for floor_idx in range(n_floors):
+                    f_z = z_floor + floor_idx * actual_floor_h
+                    win_z_b = f_z + (actual_floor_h - window_h) / 2
+                    win_z_t = win_z_b + window_h
+                    if win_z_t > z_roof - window_margin_top:
+                        continue
+
+                    for wi in range(n_win):
+                        t_along = window_margin_side + step * (wi + 0.5)
+                        c_xy = p0[:2].astype(np.float64) + wdir.astype(np.float64) * t_along
+                        v, f = _window_box(
+                            c_xy, wdir.astype(np.float64), nrm.astype(np.float64),
+                            win_z_b, win_z_t, width=window_w, depth=depth,
+                        )
+                        all_v.append(v)
+                        all_f.append(f + v_offset)
+                        v_offset += len(v)
+
+            if all_v:
+                result["windows"] = (
+                    np.concatenate(all_v, axis=0).astype(np.float32),
+                    np.concatenate(all_f, axis=0).astype(np.int32),
+                )
 
     return result
 
@@ -1300,6 +1396,7 @@ def extrude_building(points: np.ndarray, lod: int,
                      multi_height: bool = False,
                      roof_inset: float = 0.0,
                      add_windows: bool = False,
+                     windows_mode: str = "procedural",
                      window_params: dict | None = None,
                      epsilon: float = 0.8,
                      roof_top_frac: float = 0.1) -> dict:
@@ -1403,19 +1500,37 @@ def extrude_building(points: np.ndarray, lod: int,
     if add_windows and len(full_fp) >= 4:
         wp = window_params or {}
         z_top_highest = blocks[-1][0]
-        win_v, win_f = _windows_on_footprint(
-            full_fp, z_floor, z_top_highest,
-            floor_height=wp.get("floor_height", 3.0),
-            window_w=wp.get("window_w", 1.2),
-            window_h=wp.get("window_h", 1.5),
-            window_spacing=wp.get("window_spacing", 3.5),
-            window_margin_side=wp.get("window_margin_side", 1.0),
-            window_margin_top=wp.get("window_margin_top", 0.6),
-            depth=wp.get("window_depth", 0.08),
-            min_wall_frac=wp.get("min_wall_frac", 0.25),
-        )
-        if len(win_v) > 0:
-            result["windows"] = (win_v, win_f)
+
+        if windows_mode == "detected":
+            # detection REALE dalla nuvola (RGB se presente, sennò voids)
+            win_v, win_f, win_meta = _windows_from_cloud(
+                points, full_fp, z_floor, z_top_highest,
+                wall_thickness=wp.get("wall_thickness", 0.35),
+                cell=wp.get("detect_cell", 0.10),
+                min_w=wp.get("window_min_w", 0.4),
+                max_w=wp.get("window_max_w", 4.0),
+                min_h=wp.get("window_min_h", 0.4),
+                max_h=wp.get("window_max_h", 3.0),
+                min_wall_frac=wp.get("min_wall_frac", 0.25),
+                depth=wp.get("window_depth", 0.08),
+            )
+            if len(win_v) > 0:
+                result["windows"] = (win_v, win_f)
+                result["_windows_meta"] = win_meta  # per statistiche in UI
+        else:
+            win_v, win_f = _windows_on_footprint(
+                full_fp, z_floor, z_top_highest,
+                floor_height=wp.get("floor_height", 3.0),
+                window_w=wp.get("window_w", 1.2),
+                window_h=wp.get("window_h", 1.5),
+                window_spacing=wp.get("window_spacing", 3.5),
+                window_margin_side=wp.get("window_margin_side", 1.0),
+                window_margin_top=wp.get("window_margin_top", 0.6),
+                depth=wp.get("window_depth", 0.08),
+                min_wall_frac=wp.get("min_wall_frac", 0.25),
+            )
+            if len(win_v) > 0:
+                result["windows"] = (win_v, win_f)
 
     return result
 
@@ -1493,6 +1608,208 @@ def _windows_on_footprint(footprint: np.ndarray, z_floor: float, z_roof: float,
     )
 
 
+def _windows_from_cloud(points: np.ndarray,
+                        footprint: np.ndarray,
+                        z_floor: float, z_roof: float,
+                        wall_thickness: float = 0.35,
+                        cell: float = 0.10,
+                        min_w: float = 0.4, max_w: float = 4.0,
+                        min_h: float = 0.4, max_h: float = 3.0,
+                        min_wall_frac: float = 0.20,
+                        depth: float = 0.08,
+                        use_rgb: bool | None = None,
+                        ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    """
+    Detection finestre REALI dalla nuvola, parete per parete.
+
+    points: (N,3) solo XYZ, oppure (N,6) con XYZ+RGB (R,G,B in 0..255).
+    Strategia per ogni parete del footprint:
+      1. seleziona i punti vicini al piano parete (|t_out| <= wall_thickness)
+      2. proietta in coord locali (u lungo parete, v altezza)
+      3. rasterizza a `cell` (default 10 cm)
+      4. classifica ogni cella come "finestra" se:
+           a) RGB: blu dominante  O  molto scura  O  chiara+neutra (riflesso cielo)
+           b) void: densità molto inferiore alla mediana della parete,
+              lontano dai bordi
+      5. morphology (close→open) + connected components
+      6. bounding box di ogni cluster → rettangolo finestra
+      7. filtra dimensioni plausibili
+
+    Ritorna (vertices, faces, window_list) dove window_list contiene metadati
+    (posizione, orientamento, dimensioni) utili per statistiche/incarto energia.
+    """
+    has_rgb = (points.ndim == 2 and points.shape[1] >= 6)
+    if use_rgb is None:
+        use_rgb = has_rgb
+
+    n_edges = len(footprint)
+    if n_edges < 3 or len(points) < 100:
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.int32), [])
+
+    try:
+        from scipy.ndimage import binary_opening, binary_closing, label
+        scipy_ok = True
+    except Exception:
+        scipy_ok = False
+
+    centroid = footprint.mean(axis=0)
+    edge_lengths = [
+        float(np.linalg.norm(footprint[(i + 1) % n_edges] - footprint[i]))
+        for i in range(n_edges)
+    ]
+    max_len = max(edge_lengths) if edge_lengths else 0.0
+
+    all_v: list[np.ndarray] = []
+    all_f: list[np.ndarray] = []
+    meta: list[dict] = []
+    v_offset = 0
+
+    pts_xy = points[:, :2].astype(np.float64)
+    pts_z = points[:, 2]
+
+    for i in range(n_edges):
+        j = (i + 1) % n_edges
+        p0 = footprint[i].astype(np.float64)
+        p1 = footprint[j].astype(np.float64)
+        wd = p1 - p0
+        wlen = float(np.linalg.norm(wd))
+        if wlen < 1.0 or wlen < max_len * min_wall_frac:
+            continue
+        wdir = wd / wlen
+        nrm = np.array([wdir[1], -wdir[0]])
+        # normale orientata verso esterno
+        if np.dot(nrm, (p0 + p1) / 2 - centroid) < 0:
+            nrm = -nrm
+
+        to_p = pts_xy - p0
+        u = to_p @ wdir
+        t_out = to_p @ nrm
+
+        # Stima l'offset della parete REALE rispetto al footprint estruso
+        # (il raster ha padding di ~1 cella → la parete vera è traslata di
+        # qualche cm. Centriamo la banda sulla mediana dei t_out plausibili.)
+        search = 1.5 * wall_thickness + 1.0
+        pre_mask = (
+            (u >= 0) & (u <= wlen) &
+            (np.abs(t_out) <= search) &
+            (pts_z >= z_floor) & (pts_z <= z_roof)
+        )
+        if pre_mask.sum() < 50:
+            continue
+        t_offset = float(np.median(t_out[pre_mask]))
+
+        mask = (
+            (u >= 0) & (u <= wlen) &
+            (np.abs(t_out - t_offset) <= wall_thickness) &
+            (pts_z >= z_floor) & (pts_z <= z_roof)
+        )
+        n_wall = int(mask.sum())
+        if n_wall < 100:
+            continue
+
+        u_sel = u[mask]
+        v_sel = pts_z[mask] - z_floor
+        h_wall = z_roof - z_floor
+
+        nu = max(10, int(wlen / cell))
+        nv = max(10, int(h_wall / cell))
+        iu = np.clip((u_sel / cell).astype(int), 0, nu - 1)
+        iv = np.clip((v_sel / cell).astype(int), 0, nv - 1)
+
+        density = np.zeros((nv, nu), dtype=np.int32)
+        np.add.at(density, (iv, iu), 1)
+
+        # -- classificazione per colore (se RGB presente)
+        win_color = np.zeros((nv, nu), dtype=bool)
+        if use_rgb and has_rgb:
+            rgb_sel = points[mask, 3:6].astype(np.float32)
+            r_sum = np.zeros((nv, nu), dtype=np.float32)
+            g_sum = np.zeros((nv, nu), dtype=np.float32)
+            b_sum = np.zeros((nv, nu), dtype=np.float32)
+            np.add.at(r_sum, (iv, iu), rgb_sel[:, 0])
+            np.add.at(g_sum, (iv, iu), rgb_sel[:, 1])
+            np.add.at(b_sum, (iv, iu), rgb_sel[:, 2])
+            d_safe = np.maximum(density, 1)
+            r_m = r_sum / d_safe
+            g_m = g_sum / d_safe
+            b_m = b_sum / d_safe
+            lum = 0.299 * r_m + 0.587 * g_m + 0.114 * b_m
+            is_blue = (b_m > r_m + 10) & (b_m > g_m) & (b_m > 60)
+            is_dark = lum < 55
+            is_skylike = (lum > 195) & (np.abs(r_m - g_m) < 20) & (np.abs(g_m - b_m) < 25)
+            win_color = (is_blue | is_dark | is_skylike) & (density > 0)
+
+        # -- voids: cella occupata ma densità <30% della mediana, lontano dai bordi
+        win_void = np.zeros((nv, nu), dtype=bool)
+        occupied = density[density > 0]
+        if occupied.size > 5:
+            med_d = float(np.median(occupied))
+            low_d = (density > 0) & (density < med_d * 0.30)
+            border = np.zeros((nv, nu), dtype=bool)
+            if nv > 6 and nu > 6:
+                border[3:-3, 3:-3] = True
+            win_void = low_d & border
+
+        win_mask = win_color | win_void
+        if not win_mask.any():
+            continue
+
+        if scipy_ok:
+            win_mask = binary_closing(win_mask, iterations=2)
+            win_mask = binary_opening(win_mask, iterations=1)
+            labeled, n_cc = label(win_mask)
+        else:
+            labeled = win_mask.astype(np.int32)
+            n_cc = 1
+
+        # orientamento cardinale (utile per incarto energia)
+        theta = float(np.degrees(np.arctan2(nrm[1], nrm[0])))
+        compass_idx = int(((theta + 360 + 22.5) % 360) // 45)
+        compass = ["E", "NE", "N", "NO", "O", "SO", "S", "SE"][compass_idx]
+
+        for cc_id in range(1, n_cc + 1):
+            ys, xs = np.where(labeled == cc_id)
+            if len(xs) < 4:
+                continue
+            u_lo = float(xs.min()) * cell
+            u_hi = float(xs.max() + 1) * cell
+            v_lo = float(ys.min()) * cell
+            v_hi = float(ys.max() + 1) * cell
+            w = u_hi - u_lo
+            h = v_hi - v_lo
+            if w < min_w or h < min_h or w > max_w or h > max_h:
+                continue
+            # scarta cluster con aspect ratio grottesco (strisce < 1:10)
+            if min(w, h) / max(w, h) < 0.10:
+                continue
+            u_c = (u_lo + u_hi) / 2
+            c_xy = p0 + wdir * u_c
+            z_b = z_floor + v_lo
+            z_t = z_floor + v_hi
+            vb, fb = _window_box(c_xy, wdir, nrm, z_b, z_t, width=w, depth=depth)
+            all_v.append(vb)
+            all_f.append(fb + v_offset)
+            v_offset += len(vb)
+            meta.append({
+                "wall_index": i,
+                "compass": compass,
+                "center_xy": (float(c_xy[0]), float(c_xy[1])),
+                "z_bot": float(z_b), "z_top": float(z_t),
+                "width": float(w), "height": float(h),
+                "area": float(w * h),
+            })
+
+    if not all_v:
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.int32), [])
+    return (
+        np.concatenate(all_v, axis=0).astype(np.float32),
+        np.concatenate(all_f, axis=0).astype(np.int32),
+        meta,
+    )
+
+
 def reconstruct_mesh_arrays(
     points: np.ndarray,
     lod: int,
@@ -1532,6 +1849,8 @@ def reconstruct_mesh_arrays(
             window_spacing=rp.get("window_spacing", 3.5),
             add_windows=rp.get("add_windows", True),
             roof_inset=rp.get("roof_inset", 0.1),
+            windows_mode=rp.get("windows_mode", "procedural"),
+            window_params=rp,
         )
 
     # --- SQUARED CONCAVE HULL (profilo reale squadrato a 90° + multi-altezze) ---
@@ -1542,6 +1861,7 @@ def reconstruct_mesh_arrays(
             multi_height=rp.get("multi_height", False),
             roof_inset=rp.get("roof_inset", 0.08),
             add_windows=rp.get("add_windows", False),
+            windows_mode=rp.get("windows_mode", "procedural"),
             window_params=rp,
             epsilon=rp.get("epsilon", 0.8),
             roof_top_frac=rp.get("roof_top_frac", 0.10),
@@ -1555,7 +1875,9 @@ def reconstruct_mesh_arrays(
             orthogonalize=False,
             multi_height=False,
             roof_inset=rp.get("roof_inset", 0.0),
-            add_windows=False,
+            add_windows=rp.get("add_windows", False),
+            windows_mode=rp.get("windows_mode", "procedural"),
+            window_params=rp,
             epsilon=rp.get("epsilon", 0.5),
             roof_top_frac=rp.get("roof_top_frac", 0.10),
         )
@@ -1696,7 +2018,10 @@ def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
 
     # Mesh per ogni parte, con flatshading per spigoli netti
     any_mesh = False
-    for name, (v, f) in mesh_dict.items():
+    for name, value in mesh_dict.items():
+        if name.startswith("_"):  # chiavi meta (es. "_windows_meta")
+            continue
+        v, f = value
         if len(f) == 0:
             continue
         any_mesh = True
@@ -1772,7 +2097,10 @@ def mesh_to_obj(parts: dict, mtl_name: str | None = None) -> str:
     if mtl_name:
         lines.append(f"mtllib {mtl_name}")
     v_offset = 1
-    for name, (verts, faces) in parts.items():
+    for name, value in parts.items():
+        if name.startswith("_"):
+            continue
+        verts, faces = value
         if len(verts) == 0 or len(faces) == 0:
             continue
         lines.append(f"o {name}")
@@ -1794,6 +2122,8 @@ def mesh_to_mtl(parts: dict) -> str:
     """MTL che replica la palette CAD usata nel viewer."""
     lines = ["# Point Cloud CAD Viewer — materials"]
     for name in parts.keys():
+        if name.startswith("_"):
+            continue
         r, g, b = _hex_to_rgb01(_color_for(name))
         lines += [
             f"newmtl {name}",
@@ -1836,7 +2166,10 @@ def mesh_to_dxf_bytes(parts: dict) -> bytes:
         "floor":   251,  # grigio scuro
         "surface": 9,
     }
-    for name, (verts, faces) in parts.items():
+    for name, value in parts.items():
+        if name.startswith("_"):
+            continue
+        verts, faces = value
         if len(verts) == 0 or len(faces) == 0:
             continue
         pref = next((p for p in aci_by_prefix if name.startswith(p)), None)
@@ -1968,15 +2301,50 @@ with st.sidebar:
         rect_params["add_windows"] = st.checkbox(
             "Aggiungi finestre",
             value=(method in ("building_rect", "building_squared")),
-            help="Distribuisce finestre procedurali sulle pareti esterne principali "
-                 "(look CAD per incarto energia).",
+            help="Distribuisce finestre sulle pareti esterne principali.",
         )
         if rect_params["add_windows"]:
-            rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
-            rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
-            rect_params["window_spacing"] = st.slider(
-                "Passo orizzontale (m)", 2.0, 8.0, 3.5, 0.1,
+            _win_mode_labels = {
+                "detected":   "🔍 Rilevate dalla nuvola (posizioni reali)",
+                "procedural": "📐 Procedurali (griglia uniforme)",
+            }
+            rect_params["windows_mode"] = st.radio(
+                "Modalità finestre",
+                options=list(_win_mode_labels.keys()),
+                format_func=lambda x: _win_mode_labels[x],
+                index=0,
+                help=(
+                    "**Rilevate** → segmenta le finestre dai punti reali:\n"
+                    "  • se la nuvola ha RGB → classifica vetro per colore\n"
+                    "    (blu/scuro/riflesso cielo)\n"
+                    "  • sempre → detect voids (buchi nella nuvola dove il laser\n"
+                    "    attraversa il vetro)\n"
+                    "**Procedurali** → pattern uniforme dai parametri sotto "
+                    "(look CAD, posizioni INVENTATE)."
+                ),
             )
+            if rect_params["windows_mode"] == "detected":
+                st.markdown("*Parametri detection dalla nuvola*")
+                rect_params["wall_thickness"] = st.slider(
+                    "Banda parete (m)", 0.10, 1.00, 0.35, 0.05,
+                    help="Distanza massima dal piano parete entro cui cercare punti.",
+                )
+                rect_params["detect_cell"] = st.slider(
+                    "Risoluzione detection (m)", 0.05, 0.30, 0.10, 0.01,
+                    help="Lato cella raster su parete. 10 cm = compromesso standard.",
+                )
+                c_w1, c_w2 = st.columns(2)
+                rect_params["window_min_w"] = c_w1.slider("Min L (m)", 0.3, 1.5, 0.4, 0.1)
+                rect_params["window_max_w"] = c_w2.slider("Max L (m)", 1.5, 6.0, 4.0, 0.1)
+                c_h1, c_h2 = st.columns(2)
+                rect_params["window_min_h"] = c_h1.slider("Min H (m)", 0.3, 1.5, 0.4, 0.1)
+                rect_params["window_max_h"] = c_h2.slider("Max H (m)", 1.5, 5.0, 3.0, 0.1)
+            else:
+                rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
+                rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
+                rect_params["window_spacing"] = st.slider(
+                    "Passo orizzontale (m)", 2.0, 8.0, 3.5, 0.1,
+                )
             rect_params["window_depth"] = st.slider(
                 "Spessore finestra (m)", 0.02, 0.25, 0.08, 0.01,
                 help="Sporgenza del box vetro dal muro.",
@@ -2006,16 +2374,22 @@ with st.sidebar:
     st.markdown(
         "**Formati supportati**\n\n"
         "- `.xyz` / `.txt` / `.csv`\n"
+        "- `.las` / `.laz` — LiDAR (RGB se presente)\n"
         "- `.dxf` — POINT/LINE/3DFACE/INSERT\n"
         "- `.dwg` — richiede ODA File Converter"
     )
     if not EZDXF_AVAILABLE:
         st.warning("`ezdxf` non installato: DXF/DWG disabilitati.")
+    if not LASPY_AVAILABLE:
+        st.warning("`laspy` non installato: LAS/LAZ disabilitati.")
 
 # Upload
+_accepted = ["xyz", "txt", "csv", "dxf", "dwg"]
+if LASPY_AVAILABLE:
+    _accepted += ["las", "laz"]
 uploaded = st.file_uploader(
-    "Trascina qui il file (.xyz / .dxf / .dwg)",
-    type=["xyz", "txt", "csv", "dxf", "dwg"],
+    "Trascina qui il file (.xyz / .las / .laz / .dxf / .dwg)",
+    type=_accepted,
 )
 
 if uploaded is None:
@@ -2038,6 +2412,8 @@ try:
             df_full = load_dxf(uploaded.getvalue())
         elif ext == ".dwg":
             df_full = load_dwg(uploaded.getvalue())
+        elif ext in (".las", ".laz"):
+            df_full = load_las(uploaded.getvalue(), suffix=ext)
         else:
             df_full = load_xyz(uploaded.getvalue())
 except Exception as e:
@@ -2207,14 +2583,21 @@ with right:
     if source_df is not None:
         with st.spinner(f"Ricostruzione superficie su {len(source_df):,} punti..."):
             try:
-                pts = source_df[["X", "Y", "Z"]].to_numpy(dtype=np.float32)
+                has_rgb = {"R", "G", "B"}.issubset(source_df.columns)
+                cols = ["X", "Y", "Z", "R", "G", "B"] if has_rgb else ["X", "Y", "Z"]
+                pts = source_df[cols].to_numpy(dtype=np.float32)
                 mesh_parts = reconstruct_mesh_arrays(
                     points=pts, lod=lod, method=method,
                     rect_params=rect_params,
                     decimate_ratio=decimate_ratio,
                 )
                 # Diagnostica: mesh quasi degenere?
-                all_v = [v for v, _ in mesh_parts.values() if len(v) > 0]
+                all_v = [v for v, _ in (
+                    (k, val) for k, val in mesh_parts.items() if not k.startswith("_")
+                ) if len(v) > 0]
+                # rigenera (helper per iterare senza le chiavi meta)
+                _mesh_items = [(k, val) for k, val in mesh_parts.items() if not k.startswith("_")]
+                all_v = [val[0] for _, val in _mesh_items if len(val[0]) > 0]
                 if all_v:
                     stacked = np.concatenate(all_v, axis=0)
                     extent = stacked.max(axis=0) - stacked.min(axis=0)
@@ -2226,7 +2609,7 @@ with right:
                         )
                 st.session_state.mesh_data = {
                     "parts": mesh_parts,
-                    "points": pts if show_points else None,
+                    "points": pts[:, :3] if show_points else None,
                 }
             except Exception as e:
                 st.error(f"Errore nella ricostruzione 3D: {e}")
@@ -2247,12 +2630,46 @@ if st.session_state.mesh_data:
     )
     st.plotly_chart(fig_3d, use_container_width=True, theme=None)
 
-    total_v = sum(len(v) for v, _ in parts.values())
-    total_f = sum(len(f) for _, f in parts.values())
+    mesh_items = [(k, v) for k, v in parts.items() if not k.startswith("_")]
+    total_v = sum(len(v) for _, (v, _) in (((k, val) for k, val in mesh_items)))
+    total_f = sum(len(f) for _, (_, f) in (((k, val) for k, val in mesh_items)))
     c1, c2, c3 = st.columns(3)
-    c1.metric("Parti mesh", len(parts))
+    c1.metric("Parti mesh", len(mesh_items))
     c2.metric("Vertici", f"{total_v:,}")
     c3.metric("Triangoli", f"{total_f:,}")
+
+    # ─── Stato modalità finestre + statistiche se detected ──────────────────
+    win_meta = parts.get("_windows_meta")
+    if win_meta is not None:
+        st.success(
+            f"🔍 **Finestre rilevate dalla nuvola**: {len(win_meta)} aperture identificate."
+        )
+        by_compass: dict[str, list[dict]] = {}
+        for w in win_meta:
+            by_compass.setdefault(w["compass"], []).append(w)
+        if by_compass:
+            rows = []
+            for d in ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]:
+                ws = by_compass.get(d, [])
+                if not ws:
+                    continue
+                tot_area = sum(w["area"] for w in ws)
+                rows.append({
+                    "Orientamento": d,
+                    "N° finestre": len(ws),
+                    "Area totale (m²)": round(tot_area, 2),
+                    "Larghezza media (m)": round(sum(w["width"] for w in ws) / len(ws), 2),
+                    "Altezza media (m)": round(sum(w["height"] for w in ws) / len(ws), 2),
+                })
+            if rows:
+                st.markdown("**Ripartizione finestre per orientamento**")
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    elif rect_params.get("windows_mode") == "procedural" and rect_params.get("add_windows"):
+        st.warning(
+            "⚠️ **Finestre procedurali**: pattern uniforme non derivato dal dato reale. "
+            "Se hai una nuvola con colori RGB, seleziona *\"Rilevate dalla nuvola\"* "
+            "per ottenere posizioni reali."
+        )
 
     # ─── EXPORT ──────────────────────────────────────────────────────────────
     st.markdown("#### 📥 Esporta per l'incarto energia")
