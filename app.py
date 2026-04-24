@@ -170,7 +170,11 @@ def load_las(file_bytes: bytes, suffix: str = ".las") -> pd.DataFrame:
     df = pd.DataFrame({"X": xs, "Y": ys, "Z": zs})
     # Esponi gli offset applicati per uso/diagnostica a valle
     df.attrs["las_offsets"] = offsets
-    df.attrs["las_crs"] = getattr(las.header, "parse_crs", lambda: None)()
+    # parse_crs richiede pyproj (opzionale): se manca, non bloccare il caricamento
+    try:
+        df.attrs["las_crs"] = las.header.parse_crs()
+    except Exception:
+        df.attrs["las_crs"] = None
 
     # RGB è presente nei Point Format 2, 3, 5, 7, 8, 10 (LAS 1.2+)
     has_rgb = all(hasattr(las, c) for c in ("red", "green", "blue"))
