@@ -1088,6 +1088,96 @@ def _decimate_parts(parts: dict, ratio: float = 0.9, min_faces: int = 500) -> di
     return out
 
 
+def _make_flat_roof(roof_corners: np.ndarray, z_roof: float
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """Tetto piatto: 4 vertici, 2 triangoli."""
+    v = np.array([
+        [roof_corners[0, 0], roof_corners[0, 1], z_roof],
+        [roof_corners[1, 0], roof_corners[1, 1], z_roof],
+        [roof_corners[2, 0], roof_corners[2, 1], z_roof],
+        [roof_corners[3, 0], roof_corners[3, 1], z_roof],
+    ], dtype=np.float32)
+    f = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    return v, f
+
+
+def _make_gable_roof(roof_corners: np.ndarray, z_eaves: float, z_ridge: float
+                     ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Tetto a capanna (2 falde + 2 timpani triangolari).
+    Il colmo va lungo l'asse PIU' LUNGO del rettangolo.
+    roof_corners: 4 vertici in ordine CCW (vista dall'alto).
+    """
+    p0, p1, p2, p3 = roof_corners[0], roof_corners[1], roof_corners[2], roof_corners[3]
+    len01 = float(np.linalg.norm(p1 - p0))
+    len12 = float(np.linalg.norm(p2 - p1))
+
+    if len01 >= len12:
+        # Lati lunghi (gronda) = 0-1 e 2-3.
+        # Lati corti (timpani) = 1-2 e 3-0.
+        # Colmo: dal punto medio di 3-0 al punto medio di 1-2.
+        m_a = (p3 + p0) / 2  # ridge endpoint sul lato 3-0
+        m_b = (p1 + p2) / 2  # ridge endpoint sul lato 1-2
+        v = np.array([
+            [p0[0], p0[1], z_eaves],   # 0
+            [p1[0], p1[1], z_eaves],   # 1
+            [p2[0], p2[1], z_eaves],   # 2
+            [p3[0], p3[1], z_eaves],   # 3
+            [m_a[0], m_a[1], z_ridge], # 4 ridge-A (sopra lato 3-0)
+            [m_b[0], m_b[1], z_ridge], # 5 ridge-B (sopra lato 1-2)
+        ], dtype=np.float32)
+        f = np.array([
+            # Falda lato 0-1 (dalla gronda 0-1 al colmo 4-5)
+            [0, 1, 5], [0, 5, 4],
+            # Falda lato 2-3 (dalla gronda 2-3 al colmo 5-4)
+            [2, 3, 4], [2, 4, 5],
+            # Timpano sopra lato 1-2 (triangolo)
+            [1, 2, 5],
+            # Timpano sopra lato 3-0 (triangolo)
+            [3, 0, 4],
+        ], dtype=np.int32)
+    else:
+        # Lati lunghi (gronda) = 1-2 e 3-0.
+        # Lati corti (timpani) = 0-1 e 2-3.
+        m_a = (p0 + p1) / 2  # ridge endpoint sul lato 0-1
+        m_b = (p2 + p3) / 2  # ridge endpoint sul lato 2-3
+        v = np.array([
+            [p0[0], p0[1], z_eaves],   # 0
+            [p1[0], p1[1], z_eaves],   # 1
+            [p2[0], p2[1], z_eaves],   # 2
+            [p3[0], p3[1], z_eaves],   # 3
+            [m_a[0], m_a[1], z_ridge], # 4 ridge-A (sopra lato 0-1)
+            [m_b[0], m_b[1], z_ridge], # 5 ridge-B (sopra lato 2-3)
+        ], dtype=np.float32)
+        f = np.array([
+            # Falda lato 1-2
+            [1, 2, 5], [1, 5, 4],
+            # Falda lato 3-0
+            [3, 0, 4], [3, 4, 5],
+            # Timpano sopra lato 0-1
+            [0, 1, 4],
+            # Timpano sopra lato 2-3
+            [2, 3, 5],
+        ], dtype=np.int32)
+    return v, f
+
+
+def _detect_ridge_height(points: np.ndarray, z_eaves: float,
+                         min_gable: float = 0.8) -> float | None:
+    """
+    Stima l'altezza del colmo dalla nuvola.
+    Usa il 99.5° percentile dei punti SOPRA z_eaves come z_ridge.
+    Ritorna z_ridge se > z_eaves + min_gable, altrimenti None.
+    """
+    above = points[points[:, 2] > z_eaves]
+    if len(above) < 50:
+        return None
+    z_ridge = float(np.percentile(above[:, 2], 99.5))
+    if z_ridge - z_eaves < min_gable:
+        return None
+    return z_ridge
+
+
 def _window_box(p_center_xy: np.ndarray, wdir: np.ndarray, nrm: np.ndarray,
                 z_bot: float, z_top: float, width: float, depth: float = 0.08
                 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1134,6 +1224,7 @@ def extrude_rectangular_building(
     roof_inset: float = 0.1,
     windows_mode: str = "procedural",
     window_params: dict | None = None,
+    roof_style: str = "auto",  # "flat" | "gable" | "auto"
 ) -> dict:
     """
     Ricostruzione rettangolare (Minimum Bounding Rectangle via PCA):
@@ -1228,15 +1319,17 @@ def extrude_rectangular_building(
             nrm = -nrm
         wall_meta.append((p0, p1, wdir, nrm, wlen))
 
-    # --- TETTO: rettangolo leggermente rientrato rispetto al muro ---
+    # --- TETTO: piatto o a falde, in base a roof_style ---
     roof_corners = _inset_polygon(corners.astype(np.float64), roof_inset) if roof_inset > 0 else corners
-    roof_v = np.array([
-        [roof_corners[0, 0], roof_corners[0, 1], z_roof],
-        [roof_corners[1, 0], roof_corners[1, 1], z_roof],
-        [roof_corners[2, 0], roof_corners[2, 1], z_roof],
-        [roof_corners[3, 0], roof_corners[3, 1], z_roof],
-    ], dtype=np.float32)
-    roof_f = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    z_ridge_used = None
+    if roof_style in ("gable", "auto"):
+        # Forza in caso di "gable" (anche con piccolo dislivello), "auto" solo se > 0.8m
+        min_gable = 0.3 if roof_style == "gable" else 0.8
+        z_ridge_used = _detect_ridge_height(points, z_roof, min_gable=min_gable)
+    if z_ridge_used is not None:
+        roof_v, roof_f = _make_gable_roof(roof_corners, z_roof, z_ridge_used)
+    else:
+        roof_v, roof_f = _make_flat_roof(roof_corners, z_roof)
 
     # --- PAVIMENTO (winding invertito per normale verso il basso) ---
     floor_v = np.array([
@@ -1251,6 +1344,12 @@ def extrude_rectangular_building(
         "walls": (wall_v, wall_f),
         "roof": (roof_v, roof_f),
         "floor": (floor_v, floor_f),
+        "_roof_meta": {
+            "style": "gable" if z_ridge_used is not None else "flat",
+            "z_eaves": float(z_roof),
+            "z_ridge": float(z_ridge_used) if z_ridge_used is not None else None,
+            "gable_height": float(z_ridge_used - z_roof) if z_ridge_used is not None else 0.0,
+        },
     }
 
     # --- FINESTRE ---
@@ -1263,12 +1362,13 @@ def extrude_rectangular_building(
                 points, fp_xy, z_floor, z_roof,
                 wall_thickness=wp.get("wall_thickness", 0.35),
                 cell=wp.get("detect_cell", 0.10),
-                min_w=wp.get("window_min_w", 0.4),
+                min_w=wp.get("window_min_w", 0.6),
                 max_w=wp.get("window_max_w", 4.0),
-                min_h=wp.get("window_min_h", 0.4),
+                min_h=wp.get("window_min_h", 0.8),
                 max_h=wp.get("window_max_h", 3.0),
                 min_wall_frac=wp.get("min_wall_frac", 0.25),
-                depth=0.08,
+                depth=wp.get("window_depth", 0.15),
+                merge_strength=wp.get("window_merge", 4),
             )
             if len(win_v) > 0:
                 result["windows"] = (win_v, win_f)
@@ -1422,7 +1522,8 @@ def extrude_building(points: np.ndarray, lod: int,
                      windows_mode: str = "procedural",
                      window_params: dict | None = None,
                      epsilon: float = 0.8,
-                     roof_top_frac: float = 0.1) -> dict:
+                     roof_top_frac: float = 0.1,
+                     roof_style: str = "auto") -> dict:
     """
     Ricostruzione "Incarto Energia" di un edificio:
 
@@ -1508,16 +1609,35 @@ def extrude_building(points: np.ndarray, lod: int,
     # --- Assembla mesh: SOLO muri + tetto (niente pavimento, niente alette) ---
     result: dict = {}
     single = len(blocks) == 1
+    z_ridge_used = None
     for i, (z_top, fp) in enumerate(blocks):
         wv, wf, rv, rf = _prism_from_footprint(
             fp, z_floor, z_top, roof_inset=roof_inset
         )
+        # Tetto a falde: applicabile SOLO al blocco più alto, e solo se il
+        # footprint è (quasi) rettangolare (4 vertici).
+        is_top_block = (i == len(blocks) - 1)
+        if is_top_block and roof_style in ("gable", "auto") and len(fp) == 4:
+            min_gable = 0.3 if roof_style == "gable" else 0.8
+            zr = _detect_ridge_height(points, z_top, min_gable=min_gable)
+            if zr is not None:
+                roof_corners = _inset_polygon(fp, roof_inset) if roof_inset > 0 else fp
+                rv, rf = _make_gable_roof(roof_corners.astype(np.float64), z_top, zr)
+                z_ridge_used = zr
         if single:
             result["walls"] = (wv, wf)
             result["roof"] = (rv, rf)
         else:
             result[f"walls_{i+1}"] = (wv, wf)
             result[f"roof_{i+1}"] = (rv, rf)
+
+    result["_roof_meta"] = {
+        "style": "gable" if z_ridge_used is not None else "flat",
+        "z_eaves": float(blocks[-1][0]),
+        "z_ridge": float(z_ridge_used) if z_ridge_used is not None else None,
+        "gable_height": float(z_ridge_used - blocks[-1][0]) if z_ridge_used is not None else 0.0,
+        "applicable": (len(blocks[-1][1]) == 4),
+    }
 
     # Finestre (opzionale) — solo sulle pareti esterne principali del blocco più alto
     if add_windows and len(full_fp) >= 4:
@@ -1530,12 +1650,13 @@ def extrude_building(points: np.ndarray, lod: int,
                 points, full_fp, z_floor, z_top_highest,
                 wall_thickness=wp.get("wall_thickness", 0.35),
                 cell=wp.get("detect_cell", 0.10),
-                min_w=wp.get("window_min_w", 0.4),
+                min_w=wp.get("window_min_w", 0.6),
                 max_w=wp.get("window_max_w", 4.0),
-                min_h=wp.get("window_min_h", 0.4),
+                min_h=wp.get("window_min_h", 0.8),
                 max_h=wp.get("window_max_h", 3.0),
                 min_wall_frac=wp.get("min_wall_frac", 0.25),
-                depth=wp.get("window_depth", 0.08),
+                depth=wp.get("window_depth", 0.15),
+                merge_strength=wp.get("window_merge", 4),
             )
             if len(win_v) > 0:
                 result["windows"] = (win_v, win_f)
@@ -1636,11 +1757,12 @@ def _windows_from_cloud(points: np.ndarray,
                         z_floor: float, z_roof: float,
                         wall_thickness: float = 0.35,
                         cell: float = 0.10,
-                        min_w: float = 0.4, max_w: float = 4.0,
-                        min_h: float = 0.4, max_h: float = 3.0,
+                        min_w: float = 0.6, max_w: float = 4.0,
+                        min_h: float = 0.8, max_h: float = 3.0,
                         min_wall_frac: float = 0.20,
-                        depth: float = 0.08,
+                        depth: float = 0.15,
                         use_rgb: bool | None = None,
+                        merge_strength: int = 4,
                         ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """
     Detection finestre REALI dalla nuvola, parete per parete.
@@ -1779,7 +1901,8 @@ def _windows_from_cloud(points: np.ndarray,
             continue
 
         if scipy_ok:
-            win_mask = binary_closing(win_mask, iterations=2)
+            # closing aggressivo: unisce ante adiacenti separate da montanti/battenti
+            win_mask = binary_closing(win_mask, iterations=max(1, int(merge_strength)))
             win_mask = binary_opening(win_mask, iterations=1)
             labeled, n_cc = label(win_mask)
         else:
@@ -2122,6 +2245,7 @@ def reconstruct_mesh_arrays(
             window_params=rp,
             epsilon=rp.get("epsilon", 0.8),
             roof_top_frac=rp.get("roof_top_frac", 0.10),
+            roof_style=rp.get("roof_style", "auto"),
         )
 
     # --- FACCIATA 2D (nuvole planari / sezioni) -------------------------------
@@ -2548,6 +2672,18 @@ with st.sidebar:
                 "Filtro tetto (% altezza)", 0.05, 1.00, 0.25, 0.05,
                 help="Usa solo i punti nel top-N% per stimare la sagoma.",
             )
+            _roof_labels = {
+                "auto":  "🏠 Auto (a falde se rilevato, altrimenti piatto)",
+                "gable": "🏘️ Forza tetto a falde (capanna)",
+                "flat":  "🏢 Forza tetto piatto",
+            }
+            rect_params["roof_style"] = st.radio(
+                "Tipo tetto",
+                options=list(_roof_labels.keys()),
+                format_func=lambda x: _roof_labels[x],
+                index=0,
+                help="Il tetto a falde funziona solo su sagome rettangolari (4 lati).",
+            )
             rect_params["multi_height"] = st.checkbox(
                 "Rileva piani sfalsati (torre/attico)", value=False,
             )
@@ -2568,6 +2704,28 @@ with st.sidebar:
                     )
                     rect_params["detect_cell"] = st.slider(
                         "Risoluzione detection (m)", 0.05, 0.30, 0.10, 0.01,
+                    )
+                    st.markdown("**Dimensioni finestre attese**")
+                    rect_params["window_min_w"] = st.slider(
+                        "Larghezza minima (m)", 0.3, 2.0, 0.6, 0.1,
+                        help="Sotto questa soglia il cluster viene scartato (toglie frammenti).",
+                    )
+                    rect_params["window_min_h"] = st.slider(
+                        "Altezza minima (m)", 0.3, 2.0, 0.8, 0.1,
+                    )
+                    rect_params["window_max_w"] = st.slider(
+                        "Larghezza massima (m)", 1.0, 6.0, 4.0, 0.5,
+                    )
+                    rect_params["window_max_h"] = st.slider(
+                        "Altezza massima (m)", 1.5, 4.0, 3.0, 0.1,
+                    )
+                    rect_params["window_merge"] = st.slider(
+                        "Forza unione ante (1-8)", 1, 8, 4, 1,
+                        help="Più alto = unisce ante separate da montanti in 1 finestra unica. Default 4.",
+                    )
+                    rect_params["window_depth"] = st.slider(
+                        "Profondità rientro (m)", 0.02, 0.30, 0.15, 0.01,
+                        help="Quanto la finestra rientra dal filo facciata (visibilità).",
                     )
                 else:
                     rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
@@ -2671,7 +2829,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-24b · facade 2D + simplified UI")
+st.caption(f"🛠️ build 2026-04-28 · gable roof + window tuning")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
@@ -2948,6 +3106,27 @@ if st.session_state.mesh_data:
             f"({fac_meta['facade_area']:.1f} m²) · spessore reale nuvola "
             f"{fac_meta['real_thickness']*100:.1f} cm"
         )
+
+    # ─── Stato tipo tetto ──────────────────────────────────────────────────
+    roof_meta = parts.get("_roof_meta")
+    if roof_meta:
+        if roof_meta.get("style") == "gable":
+            st.success(
+                f"🏘️ **Tetto a falde rilevato** · gronda a Z={roof_meta['z_eaves']:.2f}m, "
+                f"colmo a Z={roof_meta['z_ridge']:.2f}m "
+                f"(dislivello **{roof_meta['gable_height']:.2f}m**)"
+            )
+        elif roof_meta.get("style") == "flat":
+            if roof_meta.get("applicable") is False:
+                st.info(
+                    "🏢 Tetto piatto generato (sagoma non rettangolare → "
+                    "falde non applicabili)."
+                )
+            else:
+                st.info(
+                    "🏢 Tetto piatto generato "
+                    "(nessun colmo significativo rilevato sopra la gronda)."
+                )
 
     # ─── Stato modalità finestre + statistiche se detected ──────────────────
     win_meta = parts.get("_windows_meta")
