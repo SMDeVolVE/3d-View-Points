@@ -201,6 +201,97 @@ def swisstopo_aerial_url(e_lv95: float, n_lv95: float, half_size: float = 60) ->
     )
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_swisstopo_aerial_array(e_lv95: float, n_lv95: float,
+                                 half_size_m: float = 80,
+                                 width_px: int = 512) -> np.ndarray | None:
+    """
+    Scarica un'ortofoto svizzera dal WMS swisstopo come array RGB (uint8).
+    Ritorna None se PIL non disponibile o richiesta fallisce.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    # WMS 1.1.1 con SRS EPSG:2056 → ordine BBOX = E_min, N_min, E_max, N_max
+    bbox = (
+        f"{e_lv95 - half_size_m},{n_lv95 - half_size_m},"
+        f"{e_lv95 + half_size_m},{n_lv95 + half_size_m}"
+    )
+    url = (
+        f"https://wms.geo.admin.ch/?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+        f"&LAYERS=ch.swisstopo.swissimage&SRS=EPSG:2056&BBOX={bbox}"
+        f"&WIDTH={width_px}&HEIGHT={width_px}&FORMAT=image/jpeg&STYLES="
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "PointCloudCAD/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            img_bytes = resp.read()
+        if len(img_bytes) < 1000:  # tile vuoto
+            return None
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return np.array(img, dtype=np.uint8)
+    except Exception:
+        return None
+
+
+def build_ground_texture_mesh(image_rgb: np.ndarray,
+                              center_xy: tuple[float, float],
+                              z_floor: float,
+                              half_size_m: float,
+                              grid_n: int = 48
+                              ) -> tuple[np.ndarray, np.ndarray, list]:
+    """
+    Costruisce una mesh-piano sotto l'edificio, con i colori dell'ortofoto
+    come vertex color. Usa Plotly Mesh3d vertexcolor per aggirare il fatto
+    che Mesh3d non supporta texture UV.
+
+    Returns (vertices (N,3), faces (M,3), vertex_colors list of [r,g,b] uint8).
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.int32), [])
+    # Ridimensiona immagine alla griglia desiderata (bilineare)
+    img_pil = Image.fromarray(image_rgb).resize((grid_n, grid_n), Image.BILINEAR)
+    img_small = np.array(img_pil, dtype=np.uint8)  # (grid_n, grid_n, 3)
+
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    xs = np.linspace(cx - half_size_m, cx + half_size_m, grid_n)
+    ys = np.linspace(cy - half_size_m, cy + half_size_m, grid_n)
+
+    n_v = grid_n * grid_n
+    verts = np.zeros((n_v, 3), dtype=np.float32)
+    vcolors: list = [None] * n_v
+    z_g = z_floor - 0.05  # leggermente sotto il filo terreno
+
+    for j in range(grid_n):
+        # Flip verticale: ortofoto ha N in alto, mentre array ha riga 0 in alto
+        img_row = grid_n - 1 - j
+        for i in range(grid_n):
+            idx = j * grid_n + i
+            verts[idx, 0] = xs[i]
+            verts[idx, 1] = ys[j]
+            verts[idx, 2] = z_g
+            r, g, b = img_small[img_row, i]
+            vcolors[idx] = [int(r), int(g), int(b)]
+
+    # Triangola la griglia
+    n_quads = (grid_n - 1) * (grid_n - 1)
+    faces = np.zeros((n_quads * 2, 3), dtype=np.int32)
+    fi = 0
+    for j in range(grid_n - 1):
+        for i in range(grid_n - 1):
+            v00 = j * grid_n + i
+            v10 = j * grid_n + (i + 1)
+            v01 = (j + 1) * grid_n + i
+            v11 = (j + 1) * grid_n + (i + 1)
+            faces[fi] = [v00, v10, v11]; fi += 1
+            faces[fi] = [v00, v11, v01]; fi += 1
+    return verts, faces, vcolors
+
+
 # ---------------------------------------------------------------------------
 # PARSER .XYZ
 # ---------------------------------------------------------------------------
@@ -2521,18 +2612,20 @@ def reconstruct_mesh_arrays(
 
 # Palette CAD architettonica (look edificio reale)
 _PART_COLORS = {
-    "walls":   "#D1D1D1",   # muri grigio chiaro
-    "roof":    "#5D4037",   # tetto marrone scuro
+    "walls":   "#E8DDC8",   # intonaco beige chiaro (residenziale CH tipico)
+    "roof":    "#8B4A3A",   # tegole terracotta
     "floor":   "#3D3D3D",   # pavimento scuro (raramente visibile)
-    "windows": "#7DA9D1",   # finestre vetro azzurro riflettente
+    "windows": "#1E3A5F",   # vetro scuro riflettente (notte/cielo)
     "surface": "#B8C4D6",   # superficie organica (fallback)
+    "ground":  "#7A8B5C",   # terreno verde-oliva (fallback senza ortofoto)
 }
 # Prefisso → colore (permette varianti "walls_1", "roof_2" per blocchi multipli)
 _PART_COLORS_PREFIXES = {
-    "walls": "#D1D1D1",
-    "roof":  "#5D4037",
-    "floor": "#3D3D3D",
-    "windows": "#7DA9D1",
+    "walls":   "#E8DDC8",
+    "roof":    "#8B4A3A",
+    "floor":   "#3D3D3D",
+    "windows": "#1E3A5F",
+    "ground":  "#7A8B5C",
 }
 
 
@@ -2581,18 +2674,37 @@ def _silhouette_edges(verts: np.ndarray, faces: np.ndarray) -> list[tuple[int, i
 
 def _mesh_trace(verts, faces, color, flatshading=True, show_edges=False,
                 opacity: float = 1.0, edge_color: str = "#111111",
-                edge_width: float = 1.0):
-    """Mesh3d trace con lighting architettonico + wireframe dei soli spigoli."""
+                edge_width: float = 1.0,
+                material: str = "default"):
+    """
+    Mesh3d trace con lighting architettonico + wireframe dei soli spigoli.
+
+    `material` tunes lighting: "wall" (intonaco opaco), "glass" (vetro
+    riflettente), "roof" (tegole opache), "ground" (terreno mat),
+    "default" (preset standard).
+    """
+    if material == "glass":
+        lighting = dict(ambient=0.20, diffuse=0.30, specular=0.95,
+                        roughness=0.05, fresnel=0.80)
+    elif material == "wall":
+        lighting = dict(ambient=0.55, diffuse=0.85, specular=0.05,
+                        roughness=0.95, fresnel=0.02)
+    elif material == "roof":
+        lighting = dict(ambient=0.40, diffuse=0.85, specular=0.20,
+                        roughness=0.75, fresnel=0.10)
+    elif material == "ground":
+        lighting = dict(ambient=0.65, diffuse=0.75, specular=0.02,
+                        roughness=1.00, fresnel=0.00)
+    else:
+        lighting = dict(ambient=0.45, diffuse=0.85, specular=0.15,
+                        roughness=0.85, fresnel=0.05)
     traces = [go.Mesh3d(
         x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
         i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
         color=color,
         flatshading=flatshading,
         opacity=opacity,
-        lighting=dict(
-            ambient=0.45, diffuse=0.85,
-            specular=0.15, roughness=0.85, fresnel=0.05,
-        ),
+        lighting=lighting,
         lightposition=dict(x=10_000, y=10_000, z=20_000),
         hoverinfo="skip",
         showscale=False,
@@ -2625,6 +2737,24 @@ def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
     else:
         bg, grid, text = "#0E1117", "#2A2F3A", "#FAFAFA"
 
+    # Render PRIMA il piano-terreno texturato (se presente), così il resto
+    # delle mesh si appoggia visivamente sopra
+    ground_tex = mesh_dict.get("_ground_texture")
+    if ground_tex:
+        gv, gf, gcolors = ground_tex
+        if len(gv) > 0:
+            fig.add_trace(go.Mesh3d(
+                x=gv[:, 0], y=gv[:, 1], z=gv[:, 2],
+                i=gf[:, 0], j=gf[:, 1], k=gf[:, 2],
+                vertexcolor=gcolors,
+                flatshading=False,
+                lighting=dict(ambient=0.85, diffuse=0.30, specular=0.0,
+                              roughness=1.0, fresnel=0.0),
+                lightposition=dict(x=10_000, y=10_000, z=20_000),
+                hoverinfo="skip", showscale=False,
+                name="terreno",
+            ))
+
     # Mesh per ogni parte, con flatshading per spigoli netti
     any_mesh = False
     for name, value in mesh_dict.items():
@@ -2640,10 +2770,22 @@ def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
         is_window = name.startswith("windows")
         edges = show_edges and not is_floor and not is_window
         edge_w = 1.0 if not name.startswith("roof") else 1.2
+        # Materiale: vetro per finestre, intonaco per muri, tegole per tetto
+        if is_window:
+            mat = "glass"
+        elif name.startswith("walls"):
+            mat = "wall"
+        elif name.startswith("roof"):
+            mat = "roof"
+        elif name.startswith("ground"):
+            mat = "ground"
+        else:
+            mat = "default"
         for tr in _mesh_trace(
             v, f, color,
             flatshading=True, show_edges=edges,
             edge_color="#111111", edge_width=edge_w,
+            material=mat,
         ):
             fig.add_trace(tr)
 
@@ -3185,7 +3327,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-28d · Maps satellite + Street View embed")
+st.caption(f"🛠️ build 2026-04-28e · realistic materials + aerial ground texture")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
@@ -3409,6 +3551,40 @@ with right:
                                 "— rileva il piano e le finestre sul piano, "
                                 "senza tentare un'estrusione volumetrica."
                             )
+                # 🇨🇭 Se l'utente ha verificato l'indirizzo, prova ad aggiungere
+                # il piano-terreno con ortofoto swisstopo come texture.
+                swiss_data = st.session_state.get("swiss_buildings")
+                if swiss_data and swiss_data.get("geo"):
+                    try:
+                        geo_ = swiss_data["geo"]
+                        # Centro mesh (XY centroid)
+                        mesh_items_loc = [(k, v) for k, v in mesh_parts.items()
+                                          if not k.startswith("_")]
+                        if mesh_items_loc:
+                            stacked_v = np.concatenate(
+                                [v for _, (v, _) in mesh_items_loc], axis=0
+                            )
+                            cx = float(stacked_v[:, 0].mean())
+                            cy = float(stacked_v[:, 1].mean())
+                            z_floor_local = float(stacked_v[:, 2].min())
+                            # Dimensiona il piano in base al footprint del modello
+                            ext_x = float(np.ptp(stacked_v[:, 0]))
+                            ext_y = float(np.ptp(stacked_v[:, 1]))
+                            half_size_m = max(40.0, max(ext_x, ext_y) * 1.0)
+                            with st.spinner("Scarico ortofoto swisstopo..."):
+                                aerial_arr = fetch_swisstopo_aerial_array(
+                                    geo_["e"], geo_["n"],
+                                    half_size_m=half_size_m, width_px=512,
+                                )
+                            if aerial_arr is not None:
+                                gv, gf, gcolors = build_ground_texture_mesh(
+                                    aerial_arr, (cx, cy), z_floor_local,
+                                    half_size_m=half_size_m, grid_n=48,
+                                )
+                                if len(gv) > 0:
+                                    mesh_parts["_ground_texture"] = (gv, gf, gcolors)
+                    except Exception:
+                        pass  # non bloccare la generazione se il piano fallisce
                 st.session_state.mesh_data = {
                     "parts": mesh_parts,
                     "points": pts[:, :3] if show_points else None,
