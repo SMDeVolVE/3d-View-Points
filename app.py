@@ -6,8 +6,11 @@ o cerchio) dalla vista planare per ritagliare il modello 3D.
 """
 
 import io
+import json
 import os
 import tempfile
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +60,143 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+# ---------------------------------------------------------------------------
+# SWISSTOPO INTEGRATION (geocoding + RegBL/GWR building lookup)
+#   API pubbliche, no API key, dati ufficiali della Confederazione svizzera.
+# ---------------------------------------------------------------------------
+def _http_get_json(url: str, timeout: float = 8.0) -> dict | None:
+    """GET JSON con timeout corto. Ritorna None su qualsiasi errore."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "PointCloudCAD/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def swisstopo_geocode(address: str) -> dict | None:
+    """
+    Geocoding via swisstopo Search API (gratuito, no key).
+    Ritorna dict con: label, x (E LV95), y (N LV95), zoomlevel.
+    """
+    if not address or len(address.strip()) < 3:
+        return None
+    q = urllib.parse.quote(address.strip())
+    url = (
+        f"https://api3.geo.admin.ch/rest/services/api/SearchServer"
+        f"?searchText={q}&type=locations&sr=2056&limit=1"
+    )
+    data = _http_get_json(url)
+    if not data or not data.get("results"):
+        return None
+    r = data["results"][0]
+    attrs = r.get("attrs", {})
+    # ATTENZIONE: l'API restituisce x/y INVERTITI rispetto alla convenzione LV95:
+    # x = Northing (1.x M), y = Easting (2.x M). Li scambio per coerenza.
+    x_api = float(attrs.get("x", 0.0))
+    y_api = float(attrs.get("y", 0.0))
+    if x_api < y_api:  # x sembra northing, y easting → swap
+        e_lv95, n_lv95 = y_api, x_api
+    else:
+        e_lv95, n_lv95 = x_api, y_api
+    return {
+        "label": attrs.get("label", "").replace("<b>", "").replace("</b>", ""),
+        "e": e_lv95,
+        "n": n_lv95,
+        "zoomlevel": attrs.get("zoomlevel"),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def swisstopo_building_info(e_lv95: float, n_lv95: float,
+                            street_filter: str = "") -> list[dict]:
+    """
+    Identifica gli edifici nel raggio attorno a (E,N) e ritorna info
+    catastali dal Registro federale degli edifici (RegBL/GWR).
+
+    `street_filter`: se passato (es. "guisan 25"), tiene solo gli edifici
+    il cui indirizzo contiene quella substring (case-insensitive). Utile
+    per limitare ai blocchi 25/25a/25b di un complesso senza includere i
+    vicini 19, 23, 27, 29.
+    """
+    # Envelope ~120m attorno al punto (intercetta blocchi multipli 25/25a/25b)
+    pad = 60
+    geom = f"{e_lv95-pad},{n_lv95-pad},{e_lv95+pad},{n_lv95+pad}"
+    url = (
+        f"https://api3.geo.admin.ch/rest/services/api/MapServer/identify"
+        f"?geometry={geom}&geometryType=esriGeometryEnvelope"
+        f"&imageDisplay=500,500,96&mapExtent={geom}&tolerance=0"
+        f"&layers=all:ch.bfs.gebaeude_wohnungs_register&sr=2056"
+        f"&geometryFormat=geojson&limit=20"
+    )
+    data = _http_get_json(url)
+    if not data:
+        return []
+    sf = street_filter.lower().strip()
+    seen_egid: set = set()
+    out: list[dict] = []
+    for feat in data.get("results", []):
+        attrs = feat.get("attributes", {}) or feat.get("properties", {})
+        if not attrs:
+            continue
+        egid = attrs.get("egid")
+        addr = (attrs.get("strname_deinr") or attrs.get("strname") or "").lower()
+        # Filtro per via/numero (se specificato dall'utente)
+        if sf:
+            # Match parziale sul prefisso "via numero": prendiamo l'ultima parola
+            # numerica della query come numero civico (es. "guisan 25" → cerca
+            # indirizzi che contengono "25", possibilmente con suffisso a/b)
+            tokens = [t for t in sf.split() if t]
+            # Cerca match di TUTTI i token significativi (street + numero)
+            if not all(t in addr for t in tokens if len(t) > 2 or t.isdigit()):
+                # Ultima chance: se c'è un numero, accetta varianti 25/25a/25b
+                num_tokens = [t for t in tokens if any(c.isdigit() for c in t)]
+                street_tokens = [t for t in tokens if len(t) > 2 and not any(c.isdigit() for c in t)]
+                ok_street = all(t in addr for t in street_tokens) if street_tokens else True
+                ok_num = False
+                if num_tokens:
+                    for nt in num_tokens:
+                        # Estrae solo le cifre
+                        digits = "".join(c for c in nt if c.isdigit())
+                        if digits and (f" {digits}" in f" {addr}" or addr.endswith(digits)
+                                       or any(addr.endswith(digits + s) for s in "abcdefg")):
+                            ok_num = True
+                            break
+                if not (ok_street and ok_num):
+                    continue
+        # Dedup per EGID
+        if egid in seen_egid:
+            continue
+        seen_egid.add(egid)
+        out.append({
+            "egid": egid,
+            "address": attrs.get("strname_deinr") or attrs.get("strname"),
+            "city": attrs.get("ggdename") or attrs.get("dplzname"),
+            "zip": attrs.get("dplz4") or attrs.get("ggdenr"),
+            "footprint_m2": attrs.get("garea"),
+            "n_floors": attrs.get("gastw"),
+            "year_built": attrs.get("gbauj"),
+            "n_dwellings": attrs.get("ganzwhg"),
+            "category_code": attrs.get("gkat"),
+            "status_code": attrs.get("gstat"),
+        })
+    return out
+
+
+def swisstopo_aerial_url(e_lv95: float, n_lv95: float, half_size: float = 60) -> str:
+    """
+    URL di una mini-aerofoto WMS (per overlay informativo).
+    half_size = mezza dimensione bbox in metri.
+    """
+    bbox = f"{e_lv95-half_size},{n_lv95-half_size},{e_lv95+half_size},{n_lv95+half_size}"
+    return (
+        f"https://wms.geo.admin.ch/?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+        f"&LAYERS=ch.swisstopo.swissimage&CRS=EPSG:2056&BBOX={bbox}"
+        f"&WIDTH=600&HEIGHT=600&FORMAT=image/jpeg&STYLES="
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2877,6 +3017,82 @@ uploaded = st.file_uploader(
     type=_accepted,
 )
 
+# 🇨🇭 Indirizzo svizzero (opzionale): verifica catastale via swisstopo
+with st.expander("🇨🇭 Verifica con catasto svizzero (opzionale)", expanded=False):
+    col_addr, col_btn = st.columns([4, 1])
+    with col_addr:
+        addr_input = st.text_input(
+            "Indirizzo edificio (CH)",
+            placeholder="es. Via Generale Guisan 25, 6900 Massagno",
+            key="swiss_addr",
+            help="Geocoding swisstopo + dati ufficiali del Registro federale degli edifici (RegBL).",
+        )
+    with col_btn:
+        st.markdown("&nbsp;")  # vertical alignment hack
+        verify_clicked = st.button("🔍 Verifica", use_container_width=True)
+
+    if verify_clicked and addr_input.strip():
+        with st.spinner("Cerco su swisstopo + RegBL..."):
+            geo = swisstopo_geocode(addr_input.strip())
+            if not geo:
+                st.session_state["swiss_buildings"] = None
+                st.error("❌ Indirizzo non trovato su swisstopo.")
+            else:
+                # Estrae street+numero dall'input per filtrare i risultati
+                # (es. "Via Generale Guisan 25, 6900 Massagno" → "guisan 25")
+                addr_lower = addr_input.strip().lower()
+                # Rimuove parole troppo generiche
+                stop = {"via", "viale", "piazza", "strada", "rue", "route",
+                        "strasse", "street", "ch-", "ch"}
+                tokens = [t.strip(",.;") for t in addr_lower.split()
+                          if t.strip(",.;") and t.strip(",.;") not in stop]
+                # Tiene solo i primi 3 token significativi (di solito strada+numero)
+                street_filter = " ".join(tokens[:3])
+                buildings = swisstopo_building_info(
+                    geo["e"], geo["n"], street_filter=street_filter
+                )
+                st.session_state["swiss_buildings"] = {
+                    "geo": geo,
+                    "buildings": buildings,
+                }
+
+    swiss_data = st.session_state.get("swiss_buildings")
+    if swiss_data and swiss_data.get("buildings") is not None:
+        geo = swiss_data["geo"]
+        buildings = swiss_data["buildings"]
+        st.success(f"📍 **{geo['label']}** · LV95: E={geo['e']:.0f} N={geo['n']:.0f}")
+        if not buildings:
+            st.warning("Nessun edificio trovato in RegBL nelle vicinanze.")
+        else:
+            st.markdown(f"**Edifici trovati: {len(buildings)}**")
+            tot_fp = 0.0
+            tot_dwell = 0
+            for b in buildings:
+                fp = b.get("footprint_m2") or 0
+                dw = b.get("n_dwellings") or 0
+                tot_fp += float(fp) if fp else 0
+                tot_dwell += int(dw) if dw else 0
+            st.dataframe(
+                [
+                    {
+                        "EGID": b.get("egid"),
+                        "Indirizzo": b.get("address"),
+                        "Footprint (m²)": b.get("footprint_m2"),
+                        "Piani": b.get("n_floors"),
+                        "Anno": b.get("year_built"),
+                        "Appartamenti": b.get("n_dwellings"),
+                    }
+                    for b in buildings
+                ],
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                f"**Totale complesso**: footprint **{tot_fp:.0f} m²**, "
+                f"**{tot_dwell} appartamenti**, "
+                f"**~{(buildings[0].get('n_floors') or 0) * 3} m** altezza stimata "
+                f"(piani × 3m)."
+            )
+
 if uploaded is None:
     st.info("👆 Carica un file per iniziare.")
     st.stop()
@@ -2916,7 +3132,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-28b · uniform windows + crash-safe gable")
+st.caption(f"🛠️ build 2026-04-28c · 🇨🇭 swisstopo + RegBL integration")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
@@ -3170,6 +3386,103 @@ if st.session_state.mesh_data:
     c1.metric("Parti mesh", len(mesh_items))
     c2.metric("Vertici", f"{total_v:,}")
     c3.metric("Triangoli", f"{total_f:,}")
+
+    # ─── Confronto con catasto svizzero (se l'utente ha verificato l'indirizzo) ───
+    swiss_data = st.session_state.get("swiss_buildings")
+    if swiss_data and swiss_data.get("buildings"):
+        buildings = swiss_data["buildings"]
+        cat_fp = sum(float(b.get("footprint_m2") or 0) for b in buildings)
+        cat_fl = max((b.get("n_floors") or 0) for b in buildings)
+        cat_dwell = sum(int(b.get("n_dwellings") or 0) for b in buildings)
+        cat_h_est = cat_fl * 3.0 if cat_fl else None
+
+        # Calcola footprint rilevato dalla mesh (proiezione XY del bbox)
+        try:
+            all_v = np.concatenate([v for _, (v, _) in mesh_items], axis=0)
+            mesh_dx = float(all_v[:, 0].max() - all_v[:, 0].min())
+            mesh_dy = float(all_v[:, 1].max() - all_v[:, 1].min())
+            mesh_dz = float(all_v[:, 2].max() - all_v[:, 2].min())
+            mesh_fp = mesh_dx * mesh_dy
+        except Exception:
+            mesh_fp = mesh_dx = mesh_dy = mesh_dz = 0.0
+
+        win_meta_local = parts.get("_windows_meta") or []
+        n_win = len(win_meta_local)
+        # Stima attesa: ~3 finestre/appartamento
+        n_win_est = cat_dwell * 3 if cat_dwell else None
+
+        st.markdown("**🇨🇭 Confronto con catasto (RegBL)**")
+        cc1, cc2, cc3 = st.columns(3)
+
+        def _delta_label(measured: float, expected: float, unit: str) -> str:
+            if not expected:
+                return f"{measured:.1f} {unit}"
+            pct = (measured - expected) / expected * 100
+            sign = "+" if pct >= 0 else ""
+            return f"{measured:.1f} / {expected:.0f} {unit} ({sign}{pct:.0f}%)"
+
+        cc1.metric(
+            "Footprint mesh / catasto",
+            _delta_label(mesh_fp, cat_fp, "m²"),
+            help="Bbox XY della mesh ricostruita vs somma footprint catastali.",
+        )
+        if cat_h_est:
+            cc2.metric(
+                "Altezza mesh / catasto",
+                _delta_label(mesh_dz, cat_h_est, "m"),
+                help=f"Altezza Z mesh vs ~{cat_fl} piani × 3m.",
+            )
+        else:
+            cc2.metric("Altezza mesh", f"{mesh_dz:.1f} m")
+        if n_win_est:
+            cc3.metric(
+                "Finestre rilevate / attese",
+                _delta_label(float(n_win), float(n_win_est), ""),
+                help=f"~3 finestre per appartamento × {cat_dwell} unità.",
+            )
+        else:
+            cc3.metric("Finestre rilevate", f"{n_win}")
+
+        # Verdetto
+        verdicts = []
+        if cat_fp:
+            ratio = mesh_fp / cat_fp
+            if ratio < 0.6:
+                verdicts.append(
+                    f"⚠️ Footprint solo **{ratio*100:.0f}%** del totale catastale — "
+                    f"probabilmente stai analizzando solo una porzione del complesso. "
+                    f"Allarga la selezione X/Y per includere tutti gli edifici."
+                )
+            elif ratio > 1.4:
+                verdicts.append(
+                    f"⚠️ Footprint **{ratio*100:.0f}%** del catastale — la sagoma "
+                    f"include probabilmente terreno/strutture esterne. Restringi la selezione."
+                )
+            else:
+                verdicts.append(f"✅ Footprint coerente con catasto ({ratio*100:.0f}%).")
+        if cat_h_est and mesh_dz:
+            hr = mesh_dz / cat_h_est
+            if hr < 0.7:
+                verdicts.append(
+                    f"⚠️ Altezza solo **{hr*100:.0f}%** dell'attesa — "
+                    f"il tetto reale potrebbe non essere stato ricostruito."
+                )
+            elif hr > 1.3:
+                verdicts.append(
+                    f"⚠️ Altezza **{hr*100:.0f}%** dell'attesa — "
+                    f"include vegetazione/antenne sopra il tetto reale."
+                )
+        if n_win_est and n_win < n_win_est * 0.4:
+            verdicts.append(
+                f"⚠️ Finestre rilevate solo **{n_win/n_win_est*100:.0f}%** dell'attese "
+                f"({n_win} vs ~{n_win_est}). Possibili cause: bassa densità nuvola, "
+                f"facciate non scansionate, RGB poco contrastato."
+            )
+        for v in verdicts:
+            if v.startswith("✅"):
+                st.success(v)
+            else:
+                st.warning(v)
 
     # ─── Facciata 2D: info piano rilevato ──────────────────────────────────
     fac_meta = parts.get("_facade_meta")
