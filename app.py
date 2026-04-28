@@ -239,7 +239,8 @@ def build_ground_texture_mesh(image_rgb: np.ndarray,
                               center_xy: tuple[float, float],
                               z_floor: float,
                               half_size_m: float,
-                              grid_n: int = 48
+                              grid_n: int = 96,
+                              rotation_deg: float = 0.0
                               ) -> tuple[np.ndarray, np.ndarray, list]:
     """
     Costruisce una mesh-piano sotto l'edificio, con i colori dell'ortofoto
@@ -260,35 +261,35 @@ def build_ground_texture_mesh(image_rgb: np.ndarray,
     cx, cy = float(center_xy[0]), float(center_xy[1])
     xs = np.linspace(cx - half_size_m, cx + half_size_m, grid_n)
     ys = np.linspace(cy - half_size_m, cy + half_size_m, grid_n)
-
-    n_v = grid_n * grid_n
-    verts = np.zeros((n_v, 3), dtype=np.float32)
-    vcolors: list = [None] * n_v
     z_g = z_floor - 0.05  # leggermente sotto il filo terreno
 
-    for j in range(grid_n):
-        # Flip verticale: ortofoto ha N in alto, mentre array ha riga 0 in alto
-        img_row = grid_n - 1 - j
-        for i in range(grid_n):
-            idx = j * grid_n + i
-            verts[idx, 0] = xs[i]
-            verts[idx, 1] = ys[j]
-            verts[idx, 2] = z_g
-            r, g, b = img_small[img_row, i]
-            vcolors[idx] = [int(r), int(g), int(b)]
+    # Vertex grid (vettorizzato)
+    XX, YY = np.meshgrid(xs, ys)  # shape (grid_n, grid_n)
+    # Rotazione opzionale attorno al centro (per allineare l'ortofoto N-up
+    # con assi locali del LAS che possono essere ruotati)
+    if abs(rotation_deg) > 0.01:
+        theta = np.deg2rad(rotation_deg)
+        ct, st_ = np.cos(theta), np.sin(theta)
+        dx = XX - cx
+        dy = YY - cy
+        XX = cx + ct * dx - st_ * dy
+        YY = cy + st_ * dx + ct * dy
+    verts = np.stack([XX.ravel(), YY.ravel(), np.full(XX.size, z_g)], axis=1).astype(np.float32)
 
-    # Triangola la griglia
-    n_quads = (grid_n - 1) * (grid_n - 1)
-    faces = np.zeros((n_quads * 2, 3), dtype=np.int32)
-    fi = 0
-    for j in range(grid_n - 1):
-        for i in range(grid_n - 1):
-            v00 = j * grid_n + i
-            v10 = j * grid_n + (i + 1)
-            v01 = (j + 1) * grid_n + i
-            v11 = (j + 1) * grid_n + (i + 1)
-            faces[fi] = [v00, v10, v11]; fi += 1
-            faces[fi] = [v00, v11, v01]; fi += 1
+    # Vertex colors: flip verticale (ortofoto N-up vs array riga 0 in alto)
+    img_flipped = img_small[::-1, :, :]
+    vcolors_arr = img_flipped.reshape(-1, 3).astype(np.uint8)
+    vcolors = vcolors_arr.tolist()
+
+    # Triangolazione vettorizzata (2 triangoli per quad)
+    j_idx, i_idx = np.meshgrid(np.arange(grid_n - 1), np.arange(grid_n - 1), indexing="ij")
+    v00 = (j_idx * grid_n + i_idx).ravel()
+    v10 = (j_idx * grid_n + i_idx + 1).ravel()
+    v01 = ((j_idx + 1) * grid_n + i_idx).ravel()
+    v11 = ((j_idx + 1) * grid_n + i_idx + 1).ravel()
+    tri1 = np.stack([v00, v10, v11], axis=1)
+    tri2 = np.stack([v00, v11, v01], axis=1)
+    faces = np.concatenate([tri1, tri2], axis=0).astype(np.int32)
     return verts, faces, vcolors
 
 
@@ -2212,11 +2213,15 @@ def _windows_from_cloud(points: np.ndarray,
         # Mediana delle dimensioni rilevate (robusto agli outlier)
         ws = np.array([c["w"] for c in candidates])
         hs = np.array([c["h"] for c in candidates])
-        final_w = float(np.median(ws))
-        final_h = float(np.median(hs))
-        # Clamp a valori plausibili
-        final_w = float(np.clip(final_w, max(min_w, 0.6), min(max_w, 2.5)))
-        final_h = float(np.clip(final_h, max(min_h, 0.8), min(max_h, 2.4)))
+        med_w = float(np.median(ws))
+        med_h = float(np.median(hs))
+        # Clamp a proporzioni residenziali realistiche.
+        # Le finestre tipiche residenziali (CH, IT, FR) sono 1.0-1.5m di
+        # larghezza e 1.2-1.6m di altezza. Forziamo un MINIMO sensato così
+        # le finestre non appaiono come quadrati 0.6×0.6 che si perdono
+        # sulla facciata di un edificio di 20m.
+        final_w = float(np.clip(med_w, 1.0, min(max_w, 2.5)))
+        final_h = float(np.clip(med_h, 1.2, min(max_h, 2.4)))
     elif uniform_size == "fixed":
         final_w = float(uniform_w)
         final_h = float(uniform_h)
@@ -2743,12 +2748,14 @@ def build_3d_figure(mesh_dict: dict, raw_points: np.ndarray | None = None,
     if ground_tex:
         gv, gf, gcolors = ground_tex
         if len(gv) > 0:
+            # Lighting molto piatto: l'ortofoto SI VEDE chiaramente,
+            # senza che il rendering la "annebbi"
             fig.add_trace(go.Mesh3d(
                 x=gv[:, 0], y=gv[:, 1], z=gv[:, 2],
                 i=gf[:, 0], j=gf[:, 1], k=gf[:, 2],
                 vertexcolor=gcolors,
                 flatshading=False,
-                lighting=dict(ambient=0.85, diffuse=0.30, specular=0.0,
+                lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0,
                               roughness=1.0, fresnel=0.0),
                 lightposition=dict(x=10_000, y=10_000, z=20_000),
                 hoverinfo="skip", showscale=False,
@@ -3127,6 +3134,12 @@ with st.sidebar:
                          format_func=lambda x: "Chiaro (CAD)" if x == "light" else "Scuro",
                          index=1)
         show_edges = st.checkbox("Mostra spigoli (wireframe)", value=True)
+        rect_params["ground_rotation"] = st.slider(
+            "Rotazione ortofoto (°)", -180, 180, 0, 5,
+            help="Se l'ortofoto sotto al modello non è allineata con l'edificio, "
+                 "ruotala in step di 5°. Le coordinate locali del LAS spesso non "
+                 "puntano a Nord-up come l'ortofoto swisstopo.",
+        )
 
         # -- Selezione --
         shape_mode = st.radio(
@@ -3327,7 +3340,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-28e · realistic materials + aerial ground texture")
+st.caption(f"🛠️ build 2026-04-28f · sharper ortofoto + bigger windows + rotation")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
@@ -3579,7 +3592,8 @@ with right:
                             if aerial_arr is not None:
                                 gv, gf, gcolors = build_ground_texture_mesh(
                                     aerial_arr, (cx, cy), z_floor_local,
-                                    half_size_m=half_size_m, grid_n=48,
+                                    half_size_m=half_size_m, grid_n=96,
+                                    rotation_deg=float(rect_params.get("ground_rotation", 0.0)),
                                 )
                                 if len(gv) > 0:
                                     mesh_parts["_ground_texture"] = (gv, gf, gcolors)
