@@ -106,6 +106,8 @@ def swisstopo_geocode(address: str) -> dict | None:
         "label": attrs.get("label", "").replace("<b>", "").replace("</b>", ""),
         "e": e_lv95,
         "n": n_lv95,
+        "lat": float(attrs.get("lat", 0.0)) or None,
+        "lon": float(attrs.get("lon", 0.0)) or None,
         "zoomlevel": attrs.get("zoomlevel"),
     }
 
@@ -3093,6 +3095,57 @@ with st.expander("🇨🇭 Verifica con catasto svizzero (opzionale)", expanded=
                 f"(piani × 3m)."
             )
 
+        # ── Vista esterna reale (Maps satellite + Street View link) ──────
+        lat = geo.get("lat")
+        lon = geo.get("lon")
+        if lat and lon:
+            st.markdown("**🗺️ Vista esterna reale**")
+            view_tab1, view_tab2, view_tab3 = st.tabs([
+                "🛰️ Satellite (Google)",
+                "🇨🇭 Aerofoto (swisstopo)",
+                "🚶 Street View",
+            ])
+            with view_tab1:
+                # Google Maps embed (no API key per la satellite view base)
+                st.components.v1.iframe(
+                    f"https://maps.google.com/maps?q={lat},{lon}&t=k&z=19&output=embed",
+                    height=420,
+                )
+                st.caption(
+                    f"📍 Marker su {lat:.5f}°N, {lon:.5f}°E · "
+                    f"[Apri in Google Maps ↗](https://www.google.com/maps/place/{lat},{lon}/@{lat},{lon},19z)"
+                )
+            with view_tab2:
+                # Swisstopo aerofoto ad alta risoluzione (migliore per la CH)
+                st.components.v1.iframe(
+                    f"https://map.geo.admin.ch/embed.html?"
+                    f"lang=it&topic=ech&bgLayer=ch.swisstopo.swissimage"
+                    f"&layers=ch.bfs.gebaeude_wohnungs_register"
+                    f"&E={geo['e']:.0f}&N={geo['n']:.0f}&zoom=11",
+                    height=420,
+                )
+                st.caption(
+                    f"📍 Coord. LV95: E={geo['e']:.0f} N={geo['n']:.0f} · "
+                    f"[Apri swisstopo ↗](https://map.geo.admin.ch/?lang=it&topic=ech"
+                    f"&bgLayer=ch.swisstopo.swissimage&E={geo['e']:.0f}&N={geo['n']:.0f}&zoom=11)"
+                )
+            with view_tab3:
+                # Google Street View embed: usa Maps Embed API senza key (parametri basici)
+                st.components.v1.iframe(
+                    f"https://www.google.com/maps?q=&layer=c&cbll={lat},{lon}"
+                    f"&cbp=11,0,0,0,0&output=svembed",
+                    height=420,
+                )
+                st.caption(
+                    f"🚶 Trascina per ruotare la vista · "
+                    f"[Apri Street View ↗](https://www.google.com/maps/@{lat},{lon},3a,75y,90h,90t/data=!3m6!1e1)"
+                )
+            st.info(
+                "💡 **Suggerimento**: usa queste viste come riferimento per "
+                "verificare visivamente la coerenza del modello 3D ricostruito "
+                "(orientamento, numero finestre per facciata, tipo tetto)."
+            )
+
 if uploaded is None:
     st.info("👆 Carica un file per iniziare.")
     st.stop()
@@ -3132,7 +3185,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-28c · 🇨🇭 swisstopo + RegBL integration")
+st.caption(f"🛠️ build 2026-04-28d · Maps satellite + Street View embed")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
