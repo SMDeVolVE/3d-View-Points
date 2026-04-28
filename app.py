@@ -1321,15 +1321,20 @@ def extrude_rectangular_building(
 
     # --- TETTO: piatto o a falde, in base a roof_style ---
     roof_corners = _inset_polygon(corners.astype(np.float64), roof_inset) if roof_inset > 0 else corners
-    z_ridge_used = None
-    if roof_style in ("gable", "auto"):
-        # Forza in caso di "gable" (anche con piccolo dislivello), "auto" solo se > 0.8m
-        min_gable = 0.3 if roof_style == "gable" else 0.8
-        z_ridge_used = _detect_ridge_height(points, z_roof, min_gable=min_gable)
-    if z_ridge_used is not None:
-        roof_v, roof_f = _make_gable_roof(roof_corners, z_roof, z_ridge_used)
-    else:
-        roof_v, roof_f = _make_flat_roof(roof_corners, z_roof)
+    roof_corners = np.asarray(roof_corners, dtype=np.float64)
+    z_ridge_used: float | None = None
+    try:
+        if roof_style in ("gable", "auto") and roof_corners.ndim == 2 and roof_corners.shape == (4, 2):
+            min_gable = 0.3 if roof_style == "gable" else 0.8
+            z_ridge_used = _detect_ridge_height(points, z_roof, min_gable=min_gable)
+        if z_ridge_used is not None:
+            roof_v, roof_f = _make_gable_roof(roof_corners, z_roof, z_ridge_used)
+        else:
+            roof_v, roof_f = _make_flat_roof(roof_corners, z_roof)
+    except Exception:
+        # Fallback ULTRA sicuro: tetto piatto sui 4 corner originali
+        z_ridge_used = None
+        roof_v, roof_f = _make_flat_roof(corners.astype(np.float64), z_roof)
 
     # --- PAVIMENTO (winding invertito per normale verso il basso) ---
     floor_v = np.array([
@@ -1369,6 +1374,9 @@ def extrude_rectangular_building(
                 min_wall_frac=wp.get("min_wall_frac", 0.25),
                 depth=wp.get("window_depth", 0.15),
                 merge_strength=wp.get("window_merge", 4),
+                uniform_size=wp.get("window_uniform", "median"),
+                uniform_w=wp.get("window_w", 1.2),
+                uniform_h=wp.get("window_h", 1.5),
             )
             if len(win_v) > 0:
                 result["windows"] = (win_v, win_f)
@@ -1617,13 +1625,22 @@ def extrude_building(points: np.ndarray, lod: int,
         # Tetto a falde: applicabile SOLO al blocco più alto, e solo se il
         # footprint è (quasi) rettangolare (4 vertici).
         is_top_block = (i == len(blocks) - 1)
-        if is_top_block and roof_style in ("gable", "auto") and len(fp) == 4:
-            min_gable = 0.3 if roof_style == "gable" else 0.8
-            zr = _detect_ridge_height(points, z_top, min_gable=min_gable)
-            if zr is not None:
-                roof_corners = _inset_polygon(fp, roof_inset) if roof_inset > 0 else fp
-                rv, rf = _make_gable_roof(roof_corners.astype(np.float64), z_top, zr)
-                z_ridge_used = zr
+        try:
+            fp_arr = np.asarray(fp, dtype=np.float64)
+            if (is_top_block
+                and roof_style in ("gable", "auto")
+                and fp_arr.ndim == 2 and fp_arr.shape == (4, 2)):
+                min_gable = 0.3 if roof_style == "gable" else 0.8
+                zr = _detect_ridge_height(points, z_top, min_gable=min_gable)
+                if zr is not None and (zr - z_top) > 0.1:
+                    roof_corners = _inset_polygon(fp_arr, roof_inset) if roof_inset > 0 else fp_arr
+                    roof_corners = np.asarray(roof_corners, dtype=np.float64)
+                    if roof_corners.shape == (4, 2):
+                        rv, rf = _make_gable_roof(roof_corners, z_top, zr)
+                        z_ridge_used = zr
+        except Exception:
+            # Mantiene il tetto piatto generato da _prism_from_footprint
+            pass
         if single:
             result["walls"] = (wv, wf)
             result["roof"] = (rv, rf)
@@ -1657,6 +1674,9 @@ def extrude_building(points: np.ndarray, lod: int,
                 min_wall_frac=wp.get("min_wall_frac", 0.25),
                 depth=wp.get("window_depth", 0.15),
                 merge_strength=wp.get("window_merge", 4),
+                uniform_size=wp.get("window_uniform", "median"),
+                uniform_w=wp.get("window_w", 1.2),
+                uniform_h=wp.get("window_h", 1.5),
             )
             if len(win_v) > 0:
                 result["windows"] = (win_v, win_f)
@@ -1763,6 +1783,9 @@ def _windows_from_cloud(points: np.ndarray,
                         depth: float = 0.15,
                         use_rgb: bool | None = None,
                         merge_strength: int = 4,
+                        uniform_size: str = "off",  # "off" | "median" | "fixed"
+                        uniform_w: float = 1.2,
+                        uniform_h: float = 1.5,
                         ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """
     Detection finestre REALI dalla nuvola, parete per parete.
@@ -1808,6 +1831,7 @@ def _windows_from_cloud(points: np.ndarray,
     all_v: list[np.ndarray] = []
     all_f: list[np.ndarray] = []
     meta: list[dict] = []
+    candidates: list[dict] = []  # raccolti durante il loop, renderizzati dopo
     v_offset = 0
 
     pts_xy = points[:, :2].astype(np.float64)
@@ -1933,18 +1957,66 @@ def _windows_from_cloud(points: np.ndarray,
             c_xy = p0 + wdir * u_c
             z_b = z_floor + v_lo
             z_t = z_floor + v_hi
-            vb, fb = _window_box(c_xy, wdir, nrm, z_b, z_t, width=w, depth=depth)
-            all_v.append(vb)
-            all_f.append(fb + v_offset)
-            v_offset += len(vb)
-            meta.append({
+            # Salva il candidato — il rendering avviene dopo, una volta deciso
+            # se usare le dimensioni rilevate o uniformi
+            candidates.append({
                 "wall_index": i,
                 "compass": compass,
-                "center_xy": (float(c_xy[0]), float(c_xy[1])),
-                "z_bot": float(z_b), "z_top": float(z_t),
-                "width": float(w), "height": float(h),
-                "area": float(w * h),
+                "p0": p0, "wdir": wdir, "nrm": nrm,
+                "u_c": float(u_c),
+                "z_b": float(z_b), "z_t": float(z_t),
+                "z_c": float((z_b + z_t) / 2),
+                "c_xy": c_xy,
+                "w": float(w), "h": float(h),
             })
+
+    # ── Determina dimensioni finali ──────────────────────────────────────────
+    if not candidates:
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.int32), [])
+
+    if uniform_size == "median":
+        # Mediana delle dimensioni rilevate (robusto agli outlier)
+        ws = np.array([c["w"] for c in candidates])
+        hs = np.array([c["h"] for c in candidates])
+        final_w = float(np.median(ws))
+        final_h = float(np.median(hs))
+        # Clamp a valori plausibili
+        final_w = float(np.clip(final_w, max(min_w, 0.6), min(max_w, 2.5)))
+        final_h = float(np.clip(final_h, max(min_h, 0.8), min(max_h, 2.4)))
+    elif uniform_size == "fixed":
+        final_w = float(uniform_w)
+        final_h = float(uniform_h)
+    else:
+        final_w = None
+        final_h = None
+
+    # ── Rendering finale ─────────────────────────────────────────────────────
+    for cand in candidates:
+        if uniform_size in ("median", "fixed") and final_w is not None:
+            w_use = final_w
+            h_use = final_h
+        else:
+            w_use = cand["w"]
+            h_use = cand["h"]
+        z_b = cand["z_c"] - h_use / 2
+        z_t = cand["z_c"] + h_use / 2
+        vb, fb = _window_box(
+            cand["c_xy"], cand["wdir"], cand["nrm"],
+            z_b, z_t, width=w_use, depth=depth,
+        )
+        all_v.append(vb)
+        all_f.append(fb + v_offset)
+        v_offset += len(vb)
+        meta.append({
+            "wall_index": cand["wall_index"],
+            "compass": cand["compass"],
+            "center_xy": (float(cand["c_xy"][0]), float(cand["c_xy"][1])),
+            "z_bot": float(z_b), "z_top": float(z_t),
+            "width": float(w_use), "height": float(h_use),
+            "area": float(w_use * h_use),
+            "raw_width": cand["w"], "raw_height": cand["h"],
+        })
 
     if not all_v:
         return (np.zeros((0, 3), dtype=np.float32),
@@ -2705,7 +2777,22 @@ with st.sidebar:
                     rect_params["detect_cell"] = st.slider(
                         "Risoluzione detection (m)", 0.05, 0.30, 0.10, 0.01,
                     )
-                    st.markdown("**Dimensioni finestre attese**")
+                    _uniform_labels = {
+                        "median": "📐 Tutte uguali (mediana rilevata)",
+                        "fixed":  "📏 Tutte uguali (dimensione fissa)",
+                        "off":    "🔬 Dimensioni reali rilevate (varie)",
+                    }
+                    rect_params["window_uniform"] = st.radio(
+                        "Resa visiva finestre",
+                        options=list(_uniform_labels.keys()),
+                        format_func=lambda x: _uniform_labels[x],
+                        index=0,
+                        help="Le posizioni rilevate sono sempre quelle reali; cambia solo la dimensione di rendering.",
+                    )
+                    if rect_params["window_uniform"] == "fixed":
+                        rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
+                        rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
+                    st.markdown("**Filtri di detection**")
                     rect_params["window_min_w"] = st.slider(
                         "Larghezza minima (m)", 0.3, 2.0, 0.6, 0.1,
                         help="Sotto questa soglia il cluster viene scartato (toglie frammenti).",
@@ -2829,7 +2916,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-28 · gable roof + window tuning")
+st.caption(f"🛠️ build 2026-04-28b · uniform windows + crash-safe gable")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
