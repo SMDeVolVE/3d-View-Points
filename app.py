@@ -1449,10 +1449,10 @@ def _window_box(p_center_xy: np.ndarray, wdir: np.ndarray, nrm: np.ndarray,
 def extrude_rectangular_building(
     points: np.ndarray,
     floor_height: float = 3.0,
-    window_w: float = 1.2,
-    window_h: float = 1.5,
-    window_spacing: float = 3.5,
-    window_margin_side: float = 1.0,
+    window_w: float = 1.0,
+    window_h: float = 1.4,
+    window_spacing: float = 2.5,
+    window_margin_side: float = 0.8,
     window_margin_top: float = 0.6,
     add_windows: bool = True,
     roof_inset: float = 0.1,
@@ -1916,19 +1916,21 @@ def extrude_building(points: np.ndarray, lod: int,
                 result["windows"] = (win_v, win_f)
                 result["_windows_meta"] = win_meta  # per statistiche in UI
         else:
-            win_v, win_f = _windows_on_footprint(
+            win_v, win_f, win_meta_proc = _windows_on_footprint(
                 full_fp, z_floor, z_top_highest,
                 floor_height=wp.get("floor_height", 3.0),
-                window_w=wp.get("window_w", 1.2),
-                window_h=wp.get("window_h", 1.5),
-                window_spacing=wp.get("window_spacing", 3.5),
-                window_margin_side=wp.get("window_margin_side", 1.0),
+                window_w=wp.get("window_w", 1.0),
+                window_h=wp.get("window_h", 1.4),
+                window_spacing=wp.get("window_spacing", 2.5),
+                window_margin_side=wp.get("window_margin_side", 0.8),
                 window_margin_top=wp.get("window_margin_top", 0.6),
-                depth=wp.get("window_depth", 0.08),
+                depth=wp.get("window_depth", 0.15),
                 min_wall_frac=wp.get("min_wall_frac", 0.25),
+                n_floors_override=wp.get("n_floors_override"),
             )
             if len(win_v) > 0:
                 result["windows"] = (win_v, win_f)
+                result["_windows_meta"] = win_meta_proc
 
     return result
 
@@ -1937,15 +1939,25 @@ def _windows_on_footprint(footprint: np.ndarray, z_floor: float, z_roof: float,
                           floor_height: float, window_w: float, window_h: float,
                           window_spacing: float, window_margin_side: float,
                           window_margin_top: float, depth: float,
-                          min_wall_frac: float
-                          ) -> tuple[np.ndarray, np.ndarray]:
+                          min_wall_frac: float,
+                          n_floors_override: int | None = None
+                          ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """
     Distribuisce finestre 3D (box sottili) SOLO sulle pareti esterne principali
     (pareti la cui lunghezza supera `min_wall_frac` * edge più lungo).
+
+    Se `n_floors_override` viene fornito (es. dal catasto RegBL), forza
+    quel numero di piani invece di stimarlo da total_h / floor_height.
+
+    Ritorna (vertices, faces, meta) — meta è una lista di dict con
+    posizione/dimensione/orientamento per ogni finestra (utile per stats).
     """
     n = len(footprint)
     total_h = z_roof - z_floor
-    n_floors = max(1, int(round(total_h / floor_height)))
+    if n_floors_override and n_floors_override > 0:
+        n_floors = int(n_floors_override)
+    else:
+        n_floors = max(1, int(round(total_h / floor_height)))
     actual_floor_h = total_h / n_floors
 
     centroid = footprint.mean(axis=0)
@@ -1974,6 +1986,7 @@ def _windows_on_footprint(footprint: np.ndarray, z_floor: float, z_roof: float,
 
     all_v: list[np.ndarray] = []
     all_f: list[np.ndarray] = []
+    meta: list[dict] = []
     v_offset = 0
     for (p0, p1, wdir, nrm, wlen) in main_edges:
         available = wlen - 2 * window_margin_side
@@ -1981,6 +1994,11 @@ def _windows_on_footprint(footprint: np.ndarray, z_floor: float, z_roof: float,
             continue
         n_win = max(1, int(available / window_spacing))
         step = available / n_win
+
+        # Compass orientation per facade
+        theta = float(np.degrees(np.arctan2(nrm[1], nrm[0])))
+        compass_idx = int(((theta + 360 + 22.5) % 360) // 45)
+        compass = ["E", "NE", "N", "NO", "O", "SO", "S", "SE"][compass_idx]
 
         for floor_idx in range(n_floors):
             f_z = z_floor + floor_idx * actual_floor_h
@@ -1997,12 +2015,23 @@ def _windows_on_footprint(footprint: np.ndarray, z_floor: float, z_roof: float,
                 all_v.append(v)
                 all_f.append(f + v_offset)
                 v_offset += len(v)
+                meta.append({
+                    "wall_index": -1,  # procedural, niente raster index
+                    "compass": compass,
+                    "center_xy": (float(c_xy[0]), float(c_xy[1])),
+                    "z_bot": float(win_z_b), "z_top": float(win_z_t),
+                    "width": float(window_w), "height": float(window_h),
+                    "area": float(window_w * window_h),
+                    "floor": floor_idx + 1,
+                })
 
     if not all_v:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32)
+        return (np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.int32), [])
     return (
         np.concatenate(all_v, axis=0).astype(np.float32),
         np.concatenate(all_f, axis=0).astype(np.int32),
+        meta,
     )
 
 
@@ -2534,9 +2563,9 @@ def reconstruct_mesh_arrays(
         parts = extrude_rectangular_building(
             points,
             floor_height=rp.get("floor_height", 3.0),
-            window_w=rp.get("window_w", 1.2),
-            window_h=rp.get("window_h", 1.5),
-            window_spacing=rp.get("window_spacing", 3.5),
+            window_w=rp.get("window_w", 1.0),
+            window_h=rp.get("window_h", 1.4),
+            window_spacing=rp.get("window_spacing", 2.5),
             add_windows=rp.get("add_windows", True),
             roof_inset=rp.get("roof_inset", 0.1),
             windows_mode=rp.get("windows_mode", "procedural"),
@@ -3008,7 +3037,10 @@ with st.sidebar:
         )
         rect_params["add_windows"] = st.checkbox("Aggiungi finestre", value=True)
         if rect_params["add_windows"]:
-            rect_params["windows_mode"] = "detected"   # default intelligente
+            # NUOVO DEFAULT: griglia procedurale residenziale (look realistico,
+            # finestre allineate per piano indipendentemente dalla densità nuvola).
+            # La detection dalla nuvola si attiva esplicitamente in Opzioni avanzate.
+            rect_params["windows_mode"] = "procedural"
 
     # Facciata 2D e Superficie libera non richiedono parametri visibili.
 
@@ -3052,14 +3084,17 @@ with st.sidebar:
             )
             if rect_params.get("add_windows"):
                 _win_mode_labels = {
-                    "detected":   "🔍 Rilevate dalla nuvola (reali)",
-                    "procedural": "📐 Procedurali (griglia uniforme)",
+                    "procedural": "🏘️ Realistico (griglia residenziale)",
+                    "detected":   "🔬 Detection dalla nuvola (per analisi)",
                 }
                 rect_params["windows_mode"] = st.radio(
                     "Modalità finestre",
                     options=list(_win_mode_labels.keys()),
                     format_func=lambda x: _win_mode_labels[x],
                     index=0,
+                    help="Realistico: finestre piazzate proceduralmente in griglia, "
+                         "look professionale. Detection: rileva posizioni reali "
+                         "dalla nuvola, accurato ma dipende dalla densità del file.",
                 )
                 if rect_params["windows_mode"] == "detected":
                     rect_params["wall_thickness"] = st.slider(
@@ -3105,10 +3140,32 @@ with st.sidebar:
                         "Profondità rientro (m)", 0.02, 0.30, 0.15, 0.01,
                         help="Quanto la finestra rientra dal filo facciata (visibilità).",
                     )
-                else:
-                    rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.2, 0.1)
-                    rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.5, 0.1)
-                    rect_params["window_spacing"] = st.slider("Passo orizzontale (m)", 2.0, 8.0, 3.5, 0.1)
+                if rect_params["windows_mode"] == "procedural":
+                    # Default residenziali svizzeri tipici (1.0 x 1.4m, passo 2.5m)
+                    rect_params["window_w"] = st.slider("Larghezza finestra (m)", 0.6, 2.5, 1.0, 0.1)
+                    rect_params["window_h"] = st.slider("Altezza finestra (m)", 0.8, 2.4, 1.4, 0.1)
+                    rect_params["window_spacing"] = st.slider(
+                        "Passo orizzontale (m)", 1.5, 8.0, 2.5, 0.1,
+                        help="Distanza tra centri finestre. Residenziale tipico: 2.0-3.0m.",
+                    )
+                    rect_params["window_margin_side"] = st.slider(
+                        "Margine laterale (m)", 0.3, 3.0, 0.8, 0.1,
+                        help="Distanza tra l'angolo dell'edificio e la prima finestra.",
+                    )
+                    # Auto-derive n_floors da catasto se disponibile
+                    swiss_data_local = st.session_state.get("swiss_buildings")
+                    catasto_floors = None
+                    if swiss_data_local and swiss_data_local.get("buildings"):
+                        catasto_floors = max(
+                            (b.get("n_floors") or 0)
+                            for b in swiss_data_local["buildings"]
+                        ) or None
+                    if catasto_floors:
+                        st.caption(
+                            f"📋 N° piani usato: **{catasto_floors}** "
+                            f"(da catasto svizzero RegBL)"
+                        )
+                        rect_params["n_floors_override"] = catasto_floors
 
         elif method == "facade_2d":
             st.markdown("**Facciata 2D – dettagli detection**")
@@ -3340,7 +3397,7 @@ if _las_off:
     )
 
 # --- DIAGNOSTICA bounding box (sempre visibile) ------------------------------
-st.caption(f"🛠️ build 2026-04-28f · sharper ortofoto + bigger windows + rotation")
+st.caption(f"🛠️ build 2026-04-28g · realistic procedural windows from catasto")
 with st.expander("🔍 Diagnostica nuvola (bounding box)", expanded=True):
     _bx = float(df_full["X"].max() - df_full["X"].min())
     _by = float(df_full["Y"].max() - df_full["Y"].min())
